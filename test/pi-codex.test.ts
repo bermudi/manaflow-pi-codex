@@ -15,15 +15,18 @@ import {
 import piCodex, {
   applyPatchGrammar,
   changedPathsFromOutput,
+  CODEX_FAST_SERVICE_TIER,
   CODEX_SOL_AUTO_COMPACT_LIMIT,
   CODEX_SOL_CONTEXT_WINDOW,
   CODEX_SOL_RESERVE_TOKENS,
   collapseSteeringMessages,
   codexAutoCompactLimit,
   continueAfterSteeringMessage,
+  installCodexWebSearch,
   installCompactCompactionRenderer,
   isCodexModel,
   pathsFromPatch,
+  supportsCodexFastMode,
 } from "../extensions/pi-codex.ts";
 import cmuxTabTitle, {
   buildWorkspaceInventory,
@@ -387,6 +390,35 @@ test("recognizes Codex models", () => {
   assert.equal(isCodexModel({ provider: "openai-codex", id: "gpt-5.6-sol" } as never), true);
   assert.equal(isCodexModel({ provider: "openai", id: "gpt-5.3-codex" } as never), true);
   assert.equal(isCodexModel({ provider: "openai", id: "gpt-5.4" } as never), false);
+  assert.equal(
+    supportsCodexFastMode({ provider: "openai-codex", id: "gpt-5.6-sol" } as never),
+    true,
+  );
+  assert.equal(
+    supportsCodexFastMode({ provider: "openai-codex", id: "gpt-5.4-mini" } as never),
+    false,
+  );
+  assert.equal(
+    supportsCodexFastMode({ provider: "openrouter", id: "openai/gpt-5.6-sol" } as never),
+    false,
+  );
+});
+
+test("adds Codex's hosted live web search tool to provider payloads", () => {
+  const existingTool = { type: "function", name: "read" };
+  const payload = { tools: [existingTool] };
+
+  assert.equal(installCodexWebSearch(payload), payload);
+  assert.deepEqual(payload.tools, [
+    existingTool,
+    { type: "web_search", external_web_access: true },
+  ]);
+
+  installCodexWebSearch(payload);
+  assert.equal(
+    payload.tools.filter((tool) => tool.type === "web_search").length,
+    1,
+  );
 });
 
 test("extracts changed paths from Codex output", () => {
@@ -421,9 +453,11 @@ test("renders collapsed compaction status on one content line", () => {
 test("apply_patch captures display-oriented diffs from actual file changes", async () => {
   let tool: any;
   const pi = {
+    registerCommand() {},
     registerTool(definition: any) {
       tool = definition;
     },
+    appendEntry() {},
     getActiveTools: () => [],
     setActiveTools() {},
     on() {},
@@ -468,8 +502,16 @@ test("apply_patch captures display-oriented diffs from actual file changes", asy
 test("swaps write tools only while a Codex model is selected", async () => {
   let active = ["read", "bash", "edit", "write"];
   const handlers = new Map<string, (...args: any[]) => unknown>();
+  const commands = new Map<string, any>();
+  const fastEntries: any[] = [];
   let toolDefinition: any;
   const pi = {
+    registerCommand(name: string, definition: any) {
+      commands.set(name, definition);
+    },
+    appendEntry(customType: string, data: unknown) {
+      fastEntries.push({ type: "custom", customType, data });
+    },
     registerTool(definition: any) {
       toolDefinition = definition;
       active.push(definition.name);
@@ -491,6 +533,8 @@ test("swaps write tools only while a Codex model is selected", async () => {
 
   await handlers.get("session_start")?.({}, {
     model: { provider: "openai-codex", id: "gpt-5.6-sol", contextWindow: 272_000 },
+    sessionManager: { getBranch: () => fastEntries },
+    hasUI: false,
   });
   assert.deepEqual(active, ["read", "bash", "apply_patch"]);
   assert.equal(CODEX_SOL_CONTEXT_WINDOW, 272_000);
@@ -504,14 +548,41 @@ test("swaps write tools only while a Codex model is selected", async () => {
     shouldCompact(244_800, CODEX_SOL_CONTEXT_WINDOW, settings.getCompactionSettings()),
     true,
   );
-
-  await handlers.get("model_select")?.({
-    model: {
-      provider: "openai-codex",
-      id: "gpt-5.3-codex-spark",
-      contextWindow: 128_000,
+  const notices: string[] = [];
+  const fastCtx = {
+    model: { provider: "openai-codex", id: "gpt-5.6-sol", contextWindow: 272_000 },
+    sessionManager: { getBranch: () => fastEntries },
+    hasUI: true,
+    ui: {
+      theme: { fg: (_name: string, text: string) => text },
+      setStatus() {},
+      notify(message: string) {
+        notices.push(message);
+      },
     },
-  });
+  };
+  const defaultFastPayload: any = {};
+  handlers.get("before_provider_request")?.({ payload: defaultFastPayload }, fastCtx);
+  assert.equal(defaultFastPayload.service_tier, "priority");
+
+  await commands.get("fast").handler("off", fastCtx);
+  const disabledFastPayload: any = {};
+  handlers.get("before_provider_request")?.({ payload: disabledFastPayload }, fastCtx);
+  assert.equal(disabledFastPayload.service_tier, undefined);
+  assert.deepEqual(fastEntries.at(-1)?.data, { enabled: false });
+
+  await commands.get("fast").handler("on", fastCtx);
+  const enabledFastPayload: any = {};
+  handlers.get("before_provider_request")?.({ payload: enabledFastPayload }, fastCtx);
+  assert.equal(enabledFastPayload.service_tier, "priority");
+  assert.match(notices.at(-1) ?? "", /enabled/);
+
+  const spark = {
+    provider: "openai-codex",
+    id: "gpt-5.3-codex-spark",
+    contextWindow: 128_000,
+  };
+  await handlers.get("model_select")?.({ model: spark }, { model: spark, hasUI: false });
   assert.equal(
     shouldCompact(115_199, 128_000, settings.getCompactionSettings()),
     false,
@@ -522,9 +593,15 @@ test("swaps write tools only while a Codex model is selected", async () => {
   );
   assert.equal(codexAutoCompactLimit(128_000), 115_200);
 
-  await handlers.get("model_select")?.({
-    model: { provider: "anthropic", id: "claude-sonnet-4-6", contextWindow: 200_000 },
-  });
+  const anthropic = {
+    provider: "anthropic",
+    id: "claude-sonnet-4-6",
+    contextWindow: 200_000,
+  };
+  await handlers.get("model_select")?.(
+    { model: anthropic },
+    { model: anthropic, hasUI: false },
+  );
   assert.deepEqual(active, ["read", "bash", "edit", "write"]);
   assert.equal(settings.getCompactionSettings().reserveTokens, 16_384);
 });
@@ -543,7 +620,9 @@ test("resolves the same Responses endpoint as current OpenAI Codex compaction v2
 test("remote compaction persists and reinstalls Codex replacement history", async () => {
   const handlers = new Map<string, (...args: any[]) => any>();
   const pi = {
+    registerCommand() {},
     registerTool() {},
+    appendEntry() {},
     getActiveTools: () => ["read", "bash", "edit", "write", "apply_patch"],
     getAllTools: () => [],
     setActiveTools() {},
@@ -625,6 +704,7 @@ test("remote compaction persists and reinstalls Codex replacement history", asyn
     assert.equal(headers.get("x-codex-beta-features"), "remote_compaction_v2");
     const body = JSON.parse(String(requestedInit?.body));
     assert.equal(body.model, "gpt-5.6-sol");
+    assert.equal(body.service_tier, CODEX_FAST_SERVICE_TIER);
     assert.equal(body.stream, true);
     assert.equal(body.instructions, "You are Codex.");
     assert.equal(body.input[0].role, "user");
@@ -633,10 +713,14 @@ test("remote compaction persists and reinstalls Codex replacement history", asyn
     const compaction = result.compaction;
     assert.equal(compaction.details.output.at(-1).encrypted_content, "opaque-checkpoint");
     branch.push({ type: "compaction", details: compaction.details });
-    const providerPayload = {
+    const providerPayload: any = {
       input: [{ role: "user", content: [{ type: "input_text", text: checkpointMarker(compaction.details.checkpointId) }] }],
     };
     handlers.get("before_provider_request")?.({ payload: providerPayload }, ctx);
+    assert.equal(providerPayload.service_tier, "priority");
+    assert.deepEqual(providerPayload.tools, [
+      { type: "web_search", external_web_access: true },
+    ]);
     assert.deepEqual(providerPayload.input, compaction.details.output);
   } finally {
     globalThis.fetch = originalFetch;

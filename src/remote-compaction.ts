@@ -42,6 +42,7 @@ export interface CompactRequest {
   parallel_tool_calls: boolean;
   reasoning?: { effort: string; summary: "auto" };
   prompt_cache_key?: string;
+  service_tier?: string;
   text: { verbosity: "low" };
 }
 
@@ -130,6 +131,7 @@ export function buildCompactRequest(options: {
   customInstructions?: string;
   thinkingLevel?: string;
   promptCacheKey?: string;
+  serviceTier?: string;
   tools?: Array<{ name: string; description: string; parameters: any; constrainedSampling?: any }>;
 }): CompactRequest {
   const mappedEffort = options.thinkingLevel
@@ -169,6 +171,7 @@ export function buildCompactRequest(options: {
     parallel_tool_calls: true,
     ...(effort ? { reasoning: { effort, summary: "auto" as const } } : {}),
     ...(options.promptCacheKey ? { prompt_cache_key: options.promptCacheKey } : {}),
+    ...(options.serviceTier ? { service_tier: options.serviceTier } : {}),
     text: { verbosity: "low" },
   };
 }

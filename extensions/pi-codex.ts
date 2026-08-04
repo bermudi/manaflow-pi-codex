@@ -45,6 +45,20 @@ const compactRendererMarker: unique symbol = Symbol.for(
 const CODEX_SOL_CONTEXT_WINDOW = 272_000;
 const CODEX_SOL_AUTO_COMPACT_LIMIT = codexAutoCompactLimit(CODEX_SOL_CONTEXT_WINDOW);
 const CODEX_SOL_RESERVE_TOKENS = codexCompactionReserve(CODEX_SOL_CONTEXT_WINDOW);
+const CODEX_FAST_SERVICE_TIER = "priority";
+const CODEX_FAST_MODE_MODELS = new Set([
+  "gpt-5.4",
+  "gpt-5.5",
+  "gpt-5.6-luna",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+]);
+const CODEX_FAST_MODE_ENTRY = "pi-codex-fast-mode";
+const CODEX_FAST_MODE_STATUS = "pi-codex-fast-mode";
+const CODEX_WEB_SEARCH_TOOL = {
+  type: "web_search",
+  external_web_access: true,
+} as const;
 const compactionPatchMarker: unique symbol = Symbol.for(
   "pi-codex.provider-compaction-threshold.v1",
 ) as any;
@@ -89,6 +103,30 @@ function isOpenAICodexModel(model: Model<any> | undefined): boolean {
 
 function isCodexSolModel(model: Model<any> | undefined): boolean {
   return isOpenAICodexModel(model) && model?.id === "gpt-5.6-sol";
+}
+
+function supportsCodexFastMode(model: Model<any> | undefined): boolean {
+  return isOpenAICodexModel(model) && CODEX_FAST_MODE_MODELS.has(model?.id ?? "");
+}
+
+function installCodexWebSearch(payload: unknown): unknown {
+  if (!payload || typeof payload !== "object") return payload;
+
+  const body = payload as { tools?: unknown };
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  if (
+    tools.some(
+      (tool) =>
+        tool !== null &&
+        typeof tool === "object" &&
+        (tool as { type?: unknown }).type === CODEX_WEB_SEARCH_TOOL.type,
+    )
+  ) {
+    return payload;
+  }
+
+  body.tools = [...tools, { ...CODEX_WEB_SEARCH_TOOL }];
+  return payload;
 }
 
 function codexAutoCompactLimit(contextWindow: number): number {
@@ -194,6 +232,7 @@ export default function piCodex(pi: ExtensionAPI) {
   installCompactCompactionRenderer();
   let applyPatchSelected: boolean | undefined;
   let retryTurnState: string | undefined;
+  let fastModeEnabled = true;
   const removedForCodex = new Set<string>();
 
   function latestRemoteCompaction(ctx: { sessionManager: { getBranch(): readonly any[] } }) {
@@ -223,6 +262,60 @@ export default function piCodex(pi: ExtensionAPI) {
 
     pi.setActiveTools([...active]);
   }
+
+  function restoreFastMode(ctx: { sessionManager: { getBranch(): readonly any[] } }) {
+    const saved = [...ctx.sessionManager.getBranch()]
+      .reverse()
+      .find(
+        (entry: any) =>
+          entry.type === "custom" &&
+          entry.customType === CODEX_FAST_MODE_ENTRY &&
+          typeof entry.data?.enabled === "boolean",
+      );
+    fastModeEnabled = saved?.data.enabled ?? true;
+  }
+
+  function updateFastModeStatus(ctx: any) {
+    if (!ctx.hasUI) return;
+    const visible = fastModeEnabled && supportsCodexFastMode(ctx.model);
+    ctx.ui.setStatus(
+      CODEX_FAST_MODE_STATUS,
+      visible ? ctx.ui.theme.fg("accent", "fast") : undefined,
+    );
+  }
+
+  pi.registerCommand("fast", {
+    description: "Toggle Codex Fast mode (usage: /fast [on|off|status])",
+    handler: async (args, ctx) => {
+      const action = args.trim().toLowerCase();
+      if (action === "status") {
+        const supported = supportsCodexFastMode(ctx.model);
+        ctx.ui.notify(
+          supported
+            ? `Codex Fast mode is ${fastModeEnabled ? "on" : "off"} for ${ctx.model?.id}.`
+            : `${ctx.model?.provider ?? "No provider"}/${ctx.model?.id ?? "no model"} does not advertise Codex Fast mode.`,
+          "info",
+        );
+        return;
+      }
+      if (action && !["on", "off", "toggle"].includes(action)) {
+        ctx.ui.notify("Usage: /fast [on|off|status]", "warning");
+        return;
+      }
+
+      fastModeEnabled =
+        action === "on" ? true : action === "off" ? false : !fastModeEnabled;
+      pi.appendEntry(CODEX_FAST_MODE_ENTRY, { enabled: fastModeEnabled });
+      updateFastModeStatus(ctx);
+      const supportNote = supportsCodexFastMode(ctx.model)
+        ? ""
+        : " (the current model does not advertise Fast support)";
+      ctx.ui.notify(
+        `Codex Fast mode ${fastModeEnabled ? "enabled" : "disabled"}${supportNote}.`,
+        "info",
+      );
+    },
+  });
 
   pi.registerTool({
     name: "apply_patch",
@@ -376,6 +469,10 @@ export default function piCodex(pi: ExtensionAPI) {
       customInstructions: event.customInstructions,
       thinkingLevel: ctx.thinkingLevel,
       promptCacheKey: ctx.sessionManager.getSessionId(),
+      serviceTier:
+        fastModeEnabled && supportsCodexFastMode(model)
+          ? CODEX_FAST_SERVICE_TIER
+          : undefined,
       tools: pi
         .getAllTools()
         .filter((tool) => pi.getActiveTools().includes(tool.name))
@@ -444,6 +541,10 @@ export default function piCodex(pi: ExtensionAPI) {
 
   pi.on("before_provider_request", (event, ctx) => {
     if (ctx.model?.provider !== "openai-codex") return;
+    installCodexWebSearch(event.payload);
+    if (fastModeEnabled && supportsCodexFastMode(ctx.model)) {
+      (event.payload as Record<string, unknown>).service_tier = CODEX_FAST_SERVICE_TIER;
+    }
     const details = latestRemoteCompaction(ctx);
     if (details) return installRemoteCheckpoint(event.payload, details);
   });
@@ -457,13 +558,22 @@ export default function piCodex(pi: ExtensionAPI) {
   pi.on("agent_end", () => {
     retryTurnState = undefined;
   });
-  pi.on("session_start", (_event, ctx) => syncTools(ctx.model));
-  pi.on("model_select", (event) => syncTools(event.model));
+  pi.on("session_start", (_event, ctx) => {
+    restoreFastMode(ctx);
+    syncTools(ctx.model);
+    updateFastModeStatus(ctx);
+  });
+  pi.on("model_select", (event, ctx) => {
+    syncTools(event.model);
+    updateFastModeStatus(ctx);
+  });
 }
 
 export {
   applyPatchGrammar,
   changedPathsFromOutput,
+  CODEX_FAST_MODE_MODELS,
+  CODEX_FAST_SERVICE_TIER,
   CODEX_SOL_AUTO_COMPACT_LIMIT,
   CODEX_SOL_CONTEXT_WINDOW,
   CODEX_SOL_RESERVE_TOKENS,
@@ -471,9 +581,11 @@ export {
   codexAutoCompactLimit,
   codexCompactionReserve,
   continueAfterSteeringMessage,
+  installCodexWebSearch,
   installCompactCompactionRenderer,
   isCodexModel,
   isCodexSolModel,
   isOpenAICodexModel,
   pathsFromPatch,
+  supportsCodexFastMode,
 };

@@ -1,7 +1,7 @@
 # pi-codex
 
 A [pi](https://pi.dev) package from [Manaflow](https://github.com/manaflow-ai)
-that gives Codex models OpenAI Codex's native `apply_patch` tool.
+that gives Codex models OpenAI Codex's native `apply_patch` and web search tools.
 
 When the selected model uses the `openai-codex` provider, or its model ID contains `codex`, the extension replaces active `edit` and `write` tools with `apply_patch`. Switching to a non-Codex model restores the tools it removed.
 
@@ -74,7 +74,9 @@ The native Codex package is large because it includes the platform binary.
 - Executes patches sequentially relative to other tool calls.
 - Respects tool selection: if `apply_patch` was excluded initially, `edit` and `write` are not replaced.
 - Falls back to pi's normal `edit` and `write` tools after switching away from a Codex model.
+- Enables Codex's server-hosted live `web_search` Responses API tool for the `openai-codex` provider.
 - Uses current Codex remote compaction V2 for the `openai-codex` provider.
+- Requests Codex Fast mode (`service_tier: "priority"`) for models that advertise the Fast tier, including normal turns and remote-compaction turns.
 - Renders successful `apply_patch` results as pi-native colored diffs generated from the actual before/after files.
 - Collapses the normal compaction notice to one line; `Ctrl+O` still expands its summary.
 
@@ -111,6 +113,19 @@ For every model under the `openai-codex` provider, `pi-codex` matches Codex's de
 The older `/codex/responses/compact` endpoint remains in Codex for the legacy implementation, but it is not the default in the inspected upstream revision. There is no additional compaction-specific subrouter path: both normal and compaction V2 traffic use the resolved base URL's `/backend-api/codex/responses` route.
 
 Remote compaction is intentionally limited to the `openai-codex` provider. Other providers retain pi's normal local summary compaction.
+
+## Fast mode
+
+Fast mode defaults to on for supported `openai-codex` models. Use:
+
+```text
+/fast          # toggle
+/fast on
+/fast off
+/fast status
+```
+
+The selection is stored in the session, survives `/reload` and resume, and resets to on for a new session. Unsupported models and non-Codex providers ignore the tier selection.
 
 ## Development
 

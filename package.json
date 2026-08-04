@@ -1,7 +1,7 @@
 {
   "name": "@manaflow-ai/pi-codex",
   "version": "0.1.0",
-  "description": "Codex-native apply_patch, remote compaction, and cmux titles for pi",
+  "description": "Codex-native apply_patch, web search, remote compaction, and cmux titles for pi",
   "type": "module",
   "license": "MIT",
   "author": "Manaflow AI",
@@ -21,6 +21,7 @@
     "pi",
     "codex",
     "apply-patch",
+    "web-search",
     "cmux"
   ],
   "files": [
