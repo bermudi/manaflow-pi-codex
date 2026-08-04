@@ -22,7 +22,6 @@ import piCodex, {
   collapseSteeringMessages,
   codexAutoCompactLimit,
   continueAfterSteeringMessage,
-  installCodexWebSearch,
   installCompactCompactionRenderer,
   isCodexModel,
   pathsFromPatch,
@@ -51,6 +50,11 @@ import {
   checkpointMarker,
   resolveCompactUrl,
 } from "../src/remote-compaction.ts";
+import {
+  buildWebSearchHeaders,
+  resolveWebSearchUrl,
+  summarizeWebSearchCommands,
+} from "../src/web-search.ts";
 
 function run(executable: string, args: string[], cwd: string) {
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
@@ -404,21 +408,133 @@ test("recognizes Codex models", () => {
   );
 });
 
-test("adds Codex's hosted live web search tool to provider payloads", () => {
-  const existingTool = { type: "function", name: "read" };
-  const payload = { tools: [existingTool] };
-
-  assert.equal(installCodexWebSearch(payload), payload);
-  assert.deepEqual(payload.tools, [
-    existingTool,
-    { type: "web_search", external_web_access: true },
-  ]);
-
-  installCodexWebSearch(payload);
+test("resolves Codex standalone web search through provider base URLs", () => {
   assert.equal(
-    payload.tools.filter((tool) => tool.type === "web_search").length,
-    1,
+    resolveWebSearchUrl("http://subrouter.test/backend-api"),
+    "http://subrouter.test/backend-api/codex/alpha/search",
   );
+  assert.equal(
+    resolveWebSearchUrl("https://chatgpt.com/backend-api/codex"),
+    "https://chatgpt.com/backend-api/codex/alpha/search",
+  );
+  assert.equal(
+    summarizeWebSearchCommands({ search_query: [{ q: "OpenAI Codex" }] }),
+    "OpenAI Codex",
+  );
+
+  const tokenPayload = Buffer.from(JSON.stringify({
+    "https://api.openai.com/auth": { chatgpt_account_id: "acct_search" },
+  })).toString("base64url");
+  const headers = buildWebSearchHeaders(
+    `e30.${tokenPayload}.signature`,
+    { "X-Subrouter-Agent": "pi" },
+    { "X-Subrouter-Session": "search-session" },
+  );
+  assert.equal(headers.get("x-subrouter-agent"), "pi");
+  assert.equal(headers.get("x-subrouter-session"), "search-session");
+  assert.equal(headers.get("chatgpt-account-id"), "acct_search");
+});
+
+test("standalone web search executes through the subrouter and renders as a Pi tool", async () => {
+  const tools = new Map<string, any>();
+  const pi = {
+    registerCommand() {},
+    registerTool(definition: any) {
+      tools.set(definition.name, definition);
+    },
+    getActiveTools: () => ["web_search", "apply_patch"],
+    getAllTools: () => [...tools.values()],
+    setActiveTools() {},
+    on() {},
+  } as unknown as ExtensionAPI;
+  piCodex(pi);
+
+  const webSearch = tools.get("web_search");
+  assert.ok(webSearch);
+  const renderedCall = webSearch.renderCall(
+    { search_query: [{ q: "OpenAI Codex" }] },
+    {
+      bold: (text: string) => text,
+      fg: (_name: string, text: string) => text,
+    },
+  );
+  assert.match(renderedCall.render(120).join("\n"), /web_search OpenAI Codex/);
+
+  const tokenPayload = Buffer.from(JSON.stringify({
+    "https://api.openai.com/auth": { chatgpt_account_id: "acct_render" },
+  })).toString("base64url");
+  const token = `e30.${tokenPayload}.signature`;
+  let requestedUrl = "";
+  let requestedInit: RequestInit | undefined;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    requestedUrl = String(input);
+    requestedInit = init;
+    return new Response(JSON.stringify({
+      output: "Search result with source https://example.com",
+      results: [{ url: "https://example.com" }],
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const model = {
+      provider: "openai-codex",
+      id: "gpt-5.6-luna",
+      headers: { "X-Subrouter-Agent": "pi" },
+    };
+    const result = await webSearch.execute(
+      "search-1",
+      { search_query: [{ q: "OpenAI Codex" }], response_length: "short" },
+      new AbortController().signal,
+      undefined,
+      {
+        model,
+        modelRegistry: {
+          getApiKeyAndHeaders: async () => ({
+            ok: true,
+            apiKey: token,
+            headers: { "X-Subrouter-Session": "render-test" },
+          }),
+          getProviderAuth: async () => ({
+            auth: { baseUrl: "http://subrouter.test/backend-api" },
+          }),
+        },
+        sessionManager: {
+          getSessionId: () => "session-render",
+          getBranch: () => [{
+            type: "message",
+            message: { role: "user", content: [{ type: "text", text: "Search the web" }] },
+          }],
+        },
+      },
+    );
+    assert.equal(
+      requestedUrl,
+      "http://subrouter.test/backend-api/codex/alpha/search",
+    );
+    const headers = new Headers(requestedInit?.headers);
+    assert.equal(headers.get("x-subrouter-agent"), "pi");
+    assert.equal(headers.get("x-subrouter-session"), "render-test");
+    const body = JSON.parse(String(requestedInit?.body));
+    assert.deepEqual(body.commands.search_query, [{ q: "OpenAI Codex" }]);
+    assert.equal(result.details.endpoint, requestedUrl);
+
+    const renderedResult = webSearch.renderResult(
+      result,
+      { expanded: false },
+      { fg: (_name: string, text: string) => text },
+      { isError: false },
+    );
+    assert.match(
+      renderedResult.render(120).join("\n"),
+      /Search result with source https:\/\/example\.com/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("extracts changed paths from Codex output", () => {
@@ -536,7 +652,7 @@ test("swaps write tools only while a Codex model is selected", async () => {
     sessionManager: { getBranch: () => fastEntries },
     hasUI: false,
   });
-  assert.deepEqual(active, ["read", "bash", "apply_patch"]);
+  assert.deepEqual(active, ["read", "bash", "web_search", "apply_patch"]);
   assert.equal(CODEX_SOL_CONTEXT_WINDOW, 272_000);
   assert.equal(CODEX_SOL_AUTO_COMPACT_LIMIT, 244_800);
   assert.equal(settings.getCompactionSettings().reserveTokens, CODEX_SOL_RESERVE_TOKENS);
@@ -718,9 +834,6 @@ test("remote compaction persists and reinstalls Codex replacement history", asyn
     };
     handlers.get("before_provider_request")?.({ payload: providerPayload }, ctx);
     assert.equal(providerPayload.service_tier, "priority");
-    assert.deepEqual(providerPayload.tools, [
-      { type: "web_search", external_web_access: true },
-    ]);
     assert.deepEqual(providerPayload.input, compaction.details.output);
   } finally {
     globalThis.fetch = originalFetch;

@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Model } from "@earendil-works/pi-ai";
+import { StringEnum, type Model } from "@earendil-works/pi-ai";
 import {
   renderDiff,
   SettingsManager,
@@ -27,6 +27,14 @@ import {
   type RemoteCompactionDetails,
   resolveCompactUrl,
 } from "../src/remote-compaction.ts";
+import {
+  buildWebSearchInput,
+  fetchCodexWebSearch,
+  resolveWebSearchUrl,
+  summarizeWebSearchCommands,
+  type WebSearchCommands,
+  type WebSearchDetails,
+} from "../src/web-search.ts";
 
 const grammarPath = fileURLToPath(new URL("../src/apply-patch.lark", import.meta.url));
 const applyPatchGrammar = readFileSync(grammarPath, "utf8");
@@ -55,10 +63,6 @@ const CODEX_FAST_MODE_MODELS = new Set([
 ]);
 const CODEX_FAST_MODE_ENTRY = "pi-codex-fast-mode";
 const CODEX_FAST_MODE_STATUS = "pi-codex-fast-mode";
-const CODEX_WEB_SEARCH_TOOL = {
-  type: "web_search",
-  external_web_access: true,
-} as const;
 const compactionPatchMarker: unique symbol = Symbol.for(
   "pi-codex.provider-compaction-threshold.v1",
 ) as any;
@@ -109,26 +113,6 @@ function supportsCodexFastMode(model: Model<any> | undefined): boolean {
   return isOpenAICodexModel(model) && CODEX_FAST_MODE_MODELS.has(model?.id ?? "");
 }
 
-function installCodexWebSearch(payload: unknown): unknown {
-  if (!payload || typeof payload !== "object") return payload;
-
-  const body = payload as { tools?: unknown };
-  const tools = Array.isArray(body.tools) ? body.tools : [];
-  if (
-    tools.some(
-      (tool) =>
-        tool !== null &&
-        typeof tool === "object" &&
-        (tool as { type?: unknown }).type === CODEX_WEB_SEARCH_TOOL.type,
-    )
-  ) {
-    return payload;
-  }
-
-  body.tools = [...tools, { ...CODEX_WEB_SEARCH_TOOL }];
-  return payload;
-}
-
 function codexAutoCompactLimit(contextWindow: number): number {
   return Math.floor(contextWindow * 0.9);
 }
@@ -159,6 +143,78 @@ const applyPatchSchema = Type.Object({
   patch: Type.String({
     description: "The complete *** Begin Patch ... *** End Patch payload",
   }),
+});
+
+const searchQuerySchema = Type.Object({
+  q: Type.String(),
+  recency: Type.Optional(Type.Integer({ minimum: 0 })),
+  domains: Type.Optional(Type.Array(Type.String())),
+});
+
+const webSearchSchema = Type.Object({
+  search_query: Type.Optional(Type.Array(searchQuerySchema, { maxItems: 4 })),
+  image_query: Type.Optional(Type.Array(searchQuerySchema, { maxItems: 2 })),
+  open: Type.Optional(
+    Type.Array(
+      Type.Object({
+        ref_id: Type.String(),
+        lineno: Type.Optional(Type.Integer({ minimum: 0 })),
+      }),
+    ),
+  ),
+  click: Type.Optional(
+    Type.Array(Type.Object({ ref_id: Type.String(), id: Type.Integer({ minimum: 0 }) })),
+  ),
+  find: Type.Optional(
+    Type.Array(Type.Object({ ref_id: Type.String(), pattern: Type.String() })),
+  ),
+  screenshot: Type.Optional(
+    Type.Array(
+      Type.Object({
+        ref_id: Type.String(),
+        pageno: Type.Integer({ minimum: 0 }),
+      }),
+    ),
+  ),
+  finance: Type.Optional(
+    Type.Array(
+      Type.Object({
+        ticker: Type.String(),
+        type: StringEnum(["equity", "fund", "crypto", "index"] as const),
+        market: Type.Optional(Type.String()),
+      }),
+    ),
+  ),
+  weather: Type.Optional(
+    Type.Array(
+      Type.Object({
+        location: Type.String(),
+        start: Type.Optional(Type.String()),
+        duration: Type.Optional(Type.Integer({ minimum: 1 })),
+      }),
+    ),
+  ),
+  sports: Type.Optional(
+    Type.Array(
+      Type.Object({
+        tool: Type.Optional(StringEnum(["sports"] as const)),
+        fn: StringEnum(["schedule", "standings"] as const),
+        league: StringEnum(
+          ["nba", "wnba", "nfl", "nhl", "mlb", "epl", "ncaamb", "ncaawb", "ipl"] as const,
+        ),
+        team: Type.Optional(Type.String()),
+        opponent: Type.Optional(Type.String()),
+        date_from: Type.Optional(Type.String()),
+        date_to: Type.Optional(Type.String()),
+        num_games: Type.Optional(Type.Integer({ minimum: 1 })),
+        locale: Type.Optional(Type.String()),
+      }),
+    ),
+  ),
+  time: Type.Optional(
+    Type.Array(Type.Object({ utc_offset: Type.String() })),
+  ),
+  response_length: Type.Optional(StringEnum(["short", "medium", "long"] as const)),
 });
 
 type ApplyPatchDetails = {
@@ -231,6 +287,7 @@ export default function piCodex(pi: ExtensionAPI) {
   installCodexCompactionThreshold();
   installCompactCompactionRenderer();
   let applyPatchSelected: boolean | undefined;
+  let webSearchSelected: boolean | undefined;
   let retryTurnState: string | undefined;
   let fastModeEnabled = true;
   const removedForCodex = new Set<string>();
@@ -248,6 +305,7 @@ export default function piCodex(pi: ExtensionAPI) {
       : undefined;
     const active = new Set(pi.getActiveTools());
     applyPatchSelected ??= active.has("apply_patch");
+    webSearchSelected ??= active.has("web_search");
 
     if (isCodexModel(model) && applyPatchSelected) {
       active.add("apply_patch");
@@ -259,6 +317,8 @@ export default function piCodex(pi: ExtensionAPI) {
       for (const tool of removedForCodex) active.add(tool);
       removedForCodex.clear();
     }
+    if (isOpenAICodexModel(model) && webSearchSelected) active.add("web_search");
+    else active.delete("web_search");
 
     pi.setActiveTools([...active]);
   }
@@ -314,6 +374,66 @@ export default function piCodex(pi: ExtensionAPI) {
         `Codex Fast mode ${fastModeEnabled ? "enabled" : "disabled"}${supportNote}.`,
         "info",
       );
+    },
+  });
+
+  pi.registerTool({
+    name: "web_search",
+    label: "Web Search",
+    description:
+      "Search and browse the live web using OpenAI Codex search. Supports search queries, page opening, links, find-in-page, screenshots, finance, weather, sports, and time.",
+    promptSnippet: "Search and browse current web information through OpenAI Codex",
+    promptGuidelines: [
+      "Use web_search for current, niche, or source-dependent information instead of answering from memory.",
+      "Use web_search open, click, and find operations to inspect sources after searching.",
+    ],
+    parameters: webSearchSchema,
+    async execute(_toolCallId, commands, signal, _onUpdate, ctx) {
+      const model = ctx.model;
+      if (!model || !isOpenAICodexModel(model)) {
+        throw new Error("web_search requires an openai-codex model");
+      }
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+      if (!auth.ok || !auth.apiKey) {
+        throw new Error(auth.ok ? "OpenAI Codex OAuth token is unavailable" : auth.error);
+      }
+      const providerAuth = await ctx.modelRegistry.getProviderAuth(model.provider);
+      const endpoint = resolveWebSearchUrl(providerAuth?.auth.baseUrl ?? model.baseUrl);
+      const input = buildWebSearchInput(ctx.sessionManager.getBranch());
+      const result = await fetchCodexWebSearch({
+        endpoint,
+        token: auth.apiKey,
+        model,
+        authHeaders: auth.headers,
+        commands: commands as WebSearchCommands,
+        sessionId: ctx.sessionManager.getSessionId(),
+        input,
+        signal,
+      });
+      return {
+        content: [{ type: "text", text: result.text }],
+        details: {
+          commands,
+          endpoint,
+          results: result.response.results,
+        } satisfies WebSearchDetails,
+      };
+    },
+    renderCall(commands, theme) {
+      const summary = summarizeWebSearchCommands(commands as WebSearchCommands);
+      return new Text(
+        `${theme.fg("toolTitle", theme.bold("web_search"))} ${theme.fg("muted", summary)}`,
+        0,
+        0,
+      );
+    },
+    renderResult(result, { expanded }, theme, { isError }) {
+      const output = result.content
+        .map((item) => (item.type === "text" ? item.text : ""))
+        .join("\n");
+      const visible =
+        expanded || output.length <= 2_000 ? output : `${output.slice(0, 2_000).trimEnd()}\n…`;
+      return new Text(theme.fg(isError ? "error" : "toolOutput", visible), 0, 0);
     },
   });
 
@@ -541,7 +661,6 @@ export default function piCodex(pi: ExtensionAPI) {
 
   pi.on("before_provider_request", (event, ctx) => {
     if (ctx.model?.provider !== "openai-codex") return;
-    installCodexWebSearch(event.payload);
     if (fastModeEnabled && supportsCodexFastMode(ctx.model)) {
       (event.payload as Record<string, unknown>).service_tier = CODEX_FAST_SERVICE_TIER;
     }
@@ -581,7 +700,6 @@ export {
   codexAutoCompactLimit,
   codexCompactionReserve,
   continueAfterSteeringMessage,
-  installCodexWebSearch,
   installCompactCompactionRenderer,
   isCodexModel,
   isCodexSolModel,
