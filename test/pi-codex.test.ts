@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
+import { stripVTControlCharacters } from "node:util";
 import {
   CompactionSummaryMessageComponent,
   initTheme,
@@ -608,7 +609,7 @@ test("apply_patch captures display-oriented diffs from actual file changes", asy
       { isError: false },
     );
     const renderedText = rendered.render(120).join("\n");
-    assert.match(renderedText, /hello colored diff/);
+    assert.match(stripVTControlCharacters(renderedText), /hello colored diff/);
     assert.match(renderedText, /\u001b\[/);
   } finally {
     await rm(cwd, { recursive: true, force: true });
