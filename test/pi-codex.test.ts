@@ -23,6 +23,7 @@ import piCodex, {
   collapseSteeringMessages,
   codexAutoCompactLimit,
   continueAfterSteeringMessage,
+  formatWorkingElapsed,
   installCompactCompactionRenderer,
   isCodexModel,
   pathsFromPatch,
@@ -665,6 +666,20 @@ test("swaps write tools only while a Codex model is selected", async () => {
     shouldCompact(244_800, CODEX_SOL_CONTEXT_WINDOW, settings.getCompactionSettings()),
     true,
   );
+  let workingIndicator: { frames: string[]; intervalMs?: number } | undefined;
+  await handlers.get("session_start")?.({}, {
+    model: { provider: "openai-codex", id: "gpt-5.6-sol", contextWindow: 272_000 },
+    sessionManager: { getBranch: () => fastEntries },
+    hasUI: true,
+    ui: {
+      theme: { fg: (_name: string, text: string) => text },
+      setStatus() {},
+      setWorkingIndicator(indicator: { frames: string[]; intervalMs?: number }) {
+        workingIndicator = indicator;
+      },
+    },
+  });
+  assert.deepEqual(workingIndicator, { frames: ["●"] });
   const notices: string[] = [];
   const fastCtx = {
     model: { provider: "openai-codex", id: "gpt-5.6-sol", contextWindow: 272_000 },
@@ -721,6 +736,13 @@ test("swaps write tools only while a Codex model is selected", async () => {
   );
   assert.deepEqual(active, ["read", "bash", "edit", "write"]);
   assert.equal(settings.getCompactionSettings().reserveTokens, 16_384);
+});
+
+test("formats the selection-friendly working ticker", () => {
+  assert.equal(formatWorkingElapsed(0), "0s");
+  assert.equal(formatWorkingElapsed(59_999), "59s");
+  assert.equal(formatWorkingElapsed(65_000), "1m 5s");
+  assert.equal(formatWorkingElapsed(3_720_000), "1h 2m");
 });
 
 test("resolves the same Responses endpoint as current OpenAI Codex compaction v2", () => {

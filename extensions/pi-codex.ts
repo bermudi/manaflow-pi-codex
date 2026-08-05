@@ -63,6 +63,7 @@ const CODEX_FAST_MODE_MODELS = new Set([
 ]);
 const CODEX_FAST_MODE_ENTRY = "pi-codex-fast-mode";
 const CODEX_FAST_MODE_STATUS = "pi-codex-fast-mode";
+const STATIC_WORKING_INDICATOR = "●";
 const compactionPatchMarker: unique symbol = Symbol.for(
   "pi-codex.provider-compaction-threshold.v1",
 ) as any;
@@ -121,6 +122,15 @@ function codexAutoCompactLimit(contextWindow: number): number {
 // usage >= auto_compact_token_limit. The extra token aligns the first trigger.
 function codexCompactionReserve(contextWindow: number): number {
   return contextWindow - codexAutoCompactLimit(contextWindow) + 1;
+}
+
+function formatWorkingElapsed(elapsedMs: number): string {
+  const seconds = Math.max(0, Math.floor(elapsedMs / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
 }
 
 function installCodexCompactionThreshold() {
@@ -290,6 +300,8 @@ export default function piCodex(pi: ExtensionAPI) {
   let webSearchSelected: boolean | undefined;
   let retryTurnState: string | undefined;
   let fastModeEnabled = true;
+  let workingStartedAt: number | undefined;
+  let workingTimer: ReturnType<typeof setInterval> | undefined;
   const removedForCodex = new Set<string>();
 
   function latestRemoteCompaction(ctx: { sessionManager: { getBranch(): readonly any[] } }) {
@@ -342,6 +354,39 @@ export default function piCodex(pi: ExtensionAPI) {
       CODEX_FAST_MODE_STATUS,
       visible ? ctx.ui.theme.fg("accent", "fast") : undefined,
     );
+  }
+
+  function installSelectionFriendlyWorkingIndicator(ctx: any) {
+    if (!ctx.hasUI) return;
+    // Pi's default 80ms spinner writes to the terminal even when no streamed
+    // content changed. Terminal writes clear an in-progress text selection, so
+    // keep the same working row and status message with a static indicator.
+    // This uses the public per-session UI API rather than disabling or patching
+    // any other extension.
+    ctx.ui.setWorkingIndicator({
+      frames: [ctx.ui.theme.fg("accent", STATIC_WORKING_INDICATOR)],
+    });
+  }
+
+  function startWorkingTicker(ctx: any) {
+    if (!ctx.hasUI || workingTimer) return;
+    workingStartedAt = Date.now();
+    const update = () => {
+      if (workingStartedAt === undefined) return;
+      ctx.ui.setWorkingMessage(
+        `Working (${formatWorkingElapsed(Date.now() - workingStartedAt)})...`,
+      );
+    };
+    update();
+    workingTimer = setInterval(update, 1_000);
+    workingTimer.unref?.();
+  }
+
+  function stopWorkingTicker(ctx?: any) {
+    if (workingTimer) clearInterval(workingTimer);
+    workingTimer = undefined;
+    workingStartedAt = undefined;
+    if (ctx?.hasUI) ctx.ui.setWorkingMessage();
   }
 
   pi.registerCommand("fast", {
@@ -677,14 +722,24 @@ export default function piCodex(pi: ExtensionAPI) {
   pi.on("agent_end", () => {
     retryTurnState = undefined;
   });
+  pi.on("agent_start", (_event, ctx) => {
+    startWorkingTicker(ctx);
+  });
+  pi.on("agent_settled", (_event, ctx) => {
+    stopWorkingTicker(ctx);
+  });
   pi.on("session_start", (_event, ctx) => {
     restoreFastMode(ctx);
     syncTools(ctx.model);
     updateFastModeStatus(ctx);
+    installSelectionFriendlyWorkingIndicator(ctx);
   });
   pi.on("model_select", (event, ctx) => {
     syncTools(event.model);
     updateFastModeStatus(ctx);
+  });
+  pi.on("session_shutdown", () => {
+    stopWorkingTicker();
   });
 }
 
@@ -700,6 +755,7 @@ export {
   codexAutoCompactLimit,
   codexCompactionReserve,
   continueAfterSteeringMessage,
+  formatWorkingElapsed,
   installCompactCompactionRenderer,
   isCodexModel,
   isCodexSolModel,

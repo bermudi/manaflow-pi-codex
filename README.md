@@ -16,11 +16,11 @@ pi
 ```
 
 Use `/login` to authenticate with ChatGPT, then select an `openai-codex` model
-with `/model`. To pin the initial release instead of following the default
+with `/model`. To pin this release instead of following the default
 branch:
 
 ```bash
-pi install git:github.com/manaflow-ai/pi-codex@v0.1.0
+pi install git:github.com/manaflow-ai/pi-codex@v0.1.1
 ```
 
 > The unscoped `pi-codex` package on npm is an unrelated project. Install this
@@ -80,6 +80,9 @@ The native Codex package is large because it includes the platform binary.
 - Requests Codex Fast mode (`service_tier: "priority"`) for models that advertise the Fast tier, including normal turns and remote-compaction turns.
 - Renders successful `apply_patch` results as pi-native colored diffs generated from the actual before/after files.
 - Collapses the normal compaction notice to one line; `Ctrl+O` still expands its summary.
+- Uses a static working indicator with a once-per-second elapsed-time label
+  (`Working (12s)`, `Working (1m 5s)`) instead of Pi's selection-hostile 80 ms
+  spinner, while preserving the normal working row and every extension.
 
 ## Contextual cmux titles
 
