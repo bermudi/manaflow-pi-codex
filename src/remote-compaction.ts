@@ -1,33 +1,56 @@
-import type { Context, Model } from "@earendil-works/pi-ai";
+import { createHash } from "node:crypto";
+import type { Context, Model, Usage } from "@earendil-works/pi-ai";
 import {
   convertToLlm,
+  sessionEntryToContextMessages,
   type SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
+import {
+  stableJson,
+} from "./tool-contract.ts";
+import {
+  truncateCodexText,
+} from "./output-truncation.ts";
 
 type CompactionMessages = SessionBeforeCompactEvent["preparation"]["messagesToSummarize"];
 
-// pi's extension loader can resolve a package root and its subpath against different
-// installations when the caller's cwd is outside this package. Resolve the shared
-// converter from this module's dependency tree and import its concrete file URL.
+// Pi's extension loader can resolve a package root and its subpath against
+// different installations when the caller's cwd is outside this package.
+// Resolve the shared converter from one concrete dependency tree.
 const piAiEntryUrl = import.meta.resolve("@earendil-works/pi-ai");
-const sharedResponsesUrl = new URL("./api/openai-responses-shared.js", piAiEntryUrl).href;
-const { convertResponsesMessages, convertResponsesTools } = await import(sharedResponsesUrl);
+const sharedResponsesUrl = new URL(
+  "./api/openai-responses-shared.js",
+  piAiEntryUrl,
+).href;
+const { convertResponsesMessages, convertResponsesTools } = await import(
+  sharedResponsesUrl
+);
 
 export const REMOTE_COMPACTION_KIND = "pi-codex-remote-compaction";
-export const REMOTE_COMPACTION_VERSION = 1;
+export const REMOTE_COMPACTION_VERSION = 2;
+const LEGACY_REMOTE_COMPACTION_VERSION = 1;
 const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
+const RETAINED_HISTORY_TOKEN_BUDGET = 64_000;
+const MAX_RETAINED_AGENT_MESSAGE_TOKENS = 16_000;
 
 export type ResponseItem = Record<string, unknown>;
 
 export interface RemoteCompactionDetails {
   type: typeof REMOTE_COMPACTION_KIND;
-  version: typeof REMOTE_COMPACTION_VERSION;
+  version: typeof REMOTE_COMPACTION_VERSION | typeof LEGACY_REMOTE_COMPACTION_VERSION;
   checkpointId: string;
   endpoint: string;
   output: ResponseItem[];
   readFiles: string[];
   modifiedFiles: string[];
+  responseId?: string;
+  turnState?: string;
+  toolCatalogFingerprint?: string;
+  contextFingerprint?: string;
+  retainedContextItemCount?: number;
+  retainedHistoryVersion?: string;
+  tokenUsage?: Record<string, unknown>;
 }
 
 export interface CompactRequest {
@@ -51,10 +74,134 @@ export function isRemoteCompactionDetails(value: unknown): value is RemoteCompac
   const details = value as Partial<RemoteCompactionDetails>;
   return (
     details.type === REMOTE_COMPACTION_KIND &&
-    details.version === REMOTE_COMPACTION_VERSION &&
+    (details.version === REMOTE_COMPACTION_VERSION || details.version === LEGACY_REMOTE_COMPACTION_VERSION) &&
     typeof details.checkpointId === "string" &&
-    Array.isArray(details.output)
+    typeof details.endpoint === "string" &&
+    Array.isArray(details.output) &&
+    (details.readFiles === undefined || Array.isArray(details.readFiles)) &&
+    (details.modifiedFiles === undefined || Array.isArray(details.modifiedFiles)) &&
+    (details.responseId === undefined || typeof details.responseId === "string") &&
+    (details.turnState === undefined || typeof details.turnState === "string") &&
+    (details.toolCatalogFingerprint === undefined ||
+      typeof details.toolCatalogFingerprint === "string") &&
+    (details.contextFingerprint === undefined ||
+      typeof details.contextFingerprint === "string") &&
+    (details.retainedContextItemCount === undefined ||
+      (Number.isSafeInteger(details.retainedContextItemCount) &&
+        details.retainedContextItemCount >= 0)) &&
+    (details.tokenUsage === undefined ||
+      (typeof details.tokenUsage === "object" && details.tokenUsage !== null))
   );
+}
+
+export function fingerprintContext(items: readonly ResponseItem[]): string {
+  return createHash("sha256").update(stableJson(items)).digest("hex");
+}
+
+/**
+ * Normalize the synthetic compaction boundary so the pre-compaction request
+ * (`compaction_trigger`) and Pi's persisted checkpoint marker can be compared
+ * without treating the boundary token itself as context drift.
+ */
+export function fingerprintCheckpointInput(
+  items: readonly unknown[],
+  marker?: string,
+): string {
+  const normalized = items.map((item) => {
+    if (
+      (item && typeof item === "object" && (item as any).type === "compaction_trigger") ||
+      (marker && itemContainsMarker(item, marker))
+    ) {
+      return { type: "compaction_trigger" };
+    }
+    return item;
+  }) as ResponseItem[];
+  return fingerprintContext(normalized);
+}
+
+export function fingerprintCheckpointSuffix(
+  input: readonly unknown[],
+  marker: string,
+  itemCount: number,
+): string | undefined {
+  const markerIndex = input.findIndex((item) => itemContainsMarker(item, marker));
+  if (markerIndex < 0) return undefined;
+  const suffix = input.slice(markerIndex + 1, markerIndex + 1 + itemCount);
+  if (suffix.length !== itemCount) return undefined;
+  return fingerprintContext(suffix as ResponseItem[]);
+}
+
+export function retainedContextItems(
+  model: Model<any>,
+  branchEntries: readonly any[],
+  firstKeptEntryId: string,
+): ResponseItem[] | undefined {
+  const firstKeptIndex = branchEntries.findIndex(
+    (entry) => entry?.id === firstKeptEntryId,
+  );
+  if (firstKeptIndex < 0) return undefined;
+  const messages = branchEntries
+    .slice(firstKeptIndex)
+    .flatMap((entry) => sessionEntryToContextMessages(entry));
+  return convertCompactionMessages(model, messages as CompactionMessages);
+}
+
+function numeric(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : 0;
+}
+
+/** Convert Responses usage fields into the Usage shape Pi stores in compaction entries. */
+export function toPiUsage(value: Record<string, unknown> | undefined): Usage | undefined {
+  if (!value) return undefined;
+  const inputDetails =
+    value.input_tokens_details &&
+    typeof value.input_tokens_details === "object"
+      ? (value.input_tokens_details as Record<string, unknown>)
+      : {};
+  const outputDetails =
+    value.output_tokens_details &&
+    typeof value.output_tokens_details === "object"
+      ? (value.output_tokens_details as Record<string, unknown>)
+      : {};
+  const rawInput = numeric(value.input_tokens ?? value.inputTokens);
+  const output = numeric(value.output_tokens ?? value.outputTokens);
+  const cacheRead = numeric(
+    inputDetails.cached_tokens ??
+      value.cached_input_tokens ??
+      value.cache_read_input_tokens,
+  );
+  const cacheWrite = numeric(
+    inputDetails.cache_write_tokens ??
+      inputDetails.cache_creation_tokens ??
+      value.cache_write_tokens ??
+      value.cacheWriteTokens,
+  );
+  const input = Math.max(0, rawInput - cacheRead - cacheWrite);
+  const reasoning = numeric(
+    outputDetails.reasoning_tokens ??
+      value.reasoning_output_tokens ??
+      value.reasoningTokens,
+  );
+  const totalTokens =
+    numeric(value.total_tokens ?? value.totalTokens) ||
+    input + output + cacheRead + cacheWrite;
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    ...(reasoning > 0 ? { reasoning } : {}),
+    totalTokens,
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+    },
+  };
 }
 
 export function checkpointMarker(checkpointId: string): string {
@@ -88,11 +235,18 @@ export function extractChatGptAccountId(token: string): string {
 
 export function buildCompactHeaders(
   token: string,
-  modelHeaders?: Record<string, string>,
-  authHeaders?: Record<string, string>,
+  modelHeaders?: Record<string, string | null>,
+  authHeaders?: Record<string, string | null>,
 ): Headers {
-  const headers = new Headers(modelHeaders);
-  for (const [name, value] of Object.entries(authHeaders ?? {})) headers.set(name, value);
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(modelHeaders ?? {})) {
+    if (value == null) headers.delete(name);
+    else headers.set(name, value);
+  }
+  for (const [name, value] of Object.entries(authHeaders ?? {})) {
+    if (value == null) headers.delete(name);
+    else headers.set(name, value);
+  }
   headers.set("authorization", `Bearer ${token}`);
   if (!headers.has("chatgpt-account-id")) {
     headers.set("chatgpt-account-id", extractChatGptAccountId(token));
@@ -117,10 +271,34 @@ export function convertCompactionMessages(
   messages: CompactionMessages,
 ): ResponseItem[] {
   const context: Context = { messages: convertToLlm(messages) };
-  return convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
+  const toolCallProviders = new Set(CODEX_TOOL_CALL_PROVIDERS);
+  toolCallProviders.add(model.provider);
+  for (const message of messages as readonly any[]) {
+    if (
+      message?.api === "openai-codex-responses" &&
+      typeof message.provider === "string"
+    ) {
+      toolCallProviders.add(message.provider);
+    }
+  }
+  const converted = convertResponsesMessages(model, context, toolCallProviders, {
     includeSystemPrompt: false,
     grammarToolInputProperties: new Map([["apply_patch", "patch"]]),
   }) as unknown as ResponseItem[];
+  return converted.map((item) => {
+    if (item.type !== "custom_tool_call") return item;
+    if (typeof item.id === "string" && item.id.startsWith("ctc_")) return item;
+    if (!Object.hasOwn(item, "id")) return item;
+
+    // A call created before grammar tools used an fc_* function item ID. Pi's
+    // shared converter correctly changes its replay type to custom_tool_call,
+    // but Codex then requires a ctc_* ID. Omit the incompatible item ID rather
+    // than inventing one: call_id still pairs the output, while a fabricated ID
+    // could claim a nonexistent server-side reasoning association.
+    const sanitized = { ...item };
+    delete sanitized.id;
+    return sanitized;
+  });
 }
 
 export function buildCompactRequest(options: {
@@ -132,7 +310,13 @@ export function buildCompactRequest(options: {
   thinkingLevel?: string;
   promptCacheKey?: string;
   serviceTier?: string;
-  tools?: Array<{ name: string; description: string; parameters: any; constrainedSampling?: any }>;
+  tools?: Array<{
+    name: string;
+    description: string;
+    parameters: any;
+    constrainedSampling?: any;
+    defer_loading?: boolean;
+  }>;
 }): CompactRequest {
   const mappedEffort = options.thinkingLevel
     ? options.model.thinkingLevelMap?.[options.thinkingLevel as keyof typeof options.model.thinkingLevelMap] ??
@@ -144,9 +328,19 @@ export function buildCompactRequest(options: {
     : options.instructions;
 
   const compat = options.model.compat as
-    | { supportsOpenAIGrammarTools?: boolean; supportsStrictMode?: boolean }
+    | {
+        supportsOpenAIGrammarTools?: boolean;
+        supportsStrictMode?: boolean;
+        supportsParallelToolCalls?: boolean;
+      }
     | undefined;
   const supportsOpenAIGrammarTools = compat?.supportsOpenAIGrammarTools ?? false;
+  const parallelToolCalls =
+    (options.model as any).supportsParallelToolCalls ??
+    compat?.supportsParallelToolCalls ??
+    true;
+  const convertedTools = convertCodexTools(options.model, options.tools);
+
   return {
     model: options.model.id,
     store: false,
@@ -159,21 +353,37 @@ export function buildCompactRequest(options: {
     instructions,
     include: ["reasoning.encrypted_content"],
     tool_choice: "auto",
-    ...(options.tools?.length
-      ? {
-          tools: convertResponsesTools(options.tools, {
-            strict: null,
-            supportsStrictMode: compat?.supportsStrictMode ?? true,
-            supportsOpenAIGrammarTools,
-          }),
-        }
-      : {}),
-    parallel_tool_calls: true,
+    ...(convertedTools?.length ? { tools: convertedTools } : {}),
+    parallel_tool_calls: parallelToolCalls,
     ...(effort ? { reasoning: { effort, summary: "auto" as const } } : {}),
     ...(options.promptCacheKey ? { prompt_cache_key: options.promptCacheKey } : {}),
     ...(options.serviceTier ? { service_tier: options.serviceTier } : {}),
     text: { verbosity: "low" },
   };
+}
+
+/** Convert the package contract into the same wire shape Pi uses for a turn. */
+export function convertCodexTools(
+  model: Model<any>,
+  tools: NonNullable<CompactRequest["tools"]> | undefined,
+): unknown[] | undefined {
+  if (!tools?.length) return undefined;
+  const compat = model.compat as
+    | {
+        supportsOpenAIGrammarTools?: boolean;
+        supportsStrictMode?: boolean;
+      }
+    | undefined;
+  const converted = convertResponsesTools(tools as any, {
+    strict: null,
+    supportsStrictMode: compat?.supportsStrictMode ?? true,
+    supportsOpenAIGrammarTools: compat?.supportsOpenAIGrammarTools ?? false,
+  });
+  return converted.map((tool: any, index: number) =>
+    (tools[index] as any)?.defer_loading
+      ? { ...tool, defer_loading: true }
+      : tool,
+  );
 }
 
 const RETRYABLE_COMPACTION_STATUSES = new Set([429, 500, 502, 503, 504]);
@@ -233,10 +443,14 @@ export async function fetchRemoteCompaction(
 export function parseRemoteCompactionSse(text: string): {
   compaction: ResponseItem;
   responseId?: string;
+  tokenUsage?: Record<string, unknown>;
+  turnState?: string;
 } {
   const compactions: ResponseItem[] = [];
   let completed = false;
   let responseId: string | undefined;
+  let tokenUsage: Record<string, unknown> | undefined;
+  let turnState: string | undefined;
   for (const line of text.split(/\r?\n/)) {
     if (!line.startsWith("data:")) continue;
     const data = line.slice(5).trim();
@@ -253,34 +467,264 @@ export function parseRemoteCompactionSse(text: string): {
     if (event.type === "response.completed") {
       completed = true;
       responseId = event.response?.id ?? event.response_id;
+      if (event.response?.usage && typeof event.response.usage === "object") {
+        tokenUsage = event.response.usage;
+      } else if (event.usage && typeof event.usage === "object") {
+        tokenUsage = event.usage;
+      }
+      const candidateTurnState =
+        event.response?.turn_state ??
+        event.response?.metadata?.turn_state ??
+        event.turn_state;
+      if (typeof candidateTurnState === "string" && candidateTurnState.length > 0) {
+        turnState = candidateTurnState;
+      }
     }
   }
   if (!completed) throw new Error("Codex remote compaction stream ended before response.completed");
+  if (!responseId) {
+    throw new Error("Codex remote compaction response.completed did not include a response id");
+  }
   if (compactions.length !== 1) {
     throw new Error(
       `Codex remote compaction expected exactly one compaction item, got ${compactions.length}`,
     );
   }
-  return { compaction: compactions[0], responseId };
+  return {
+    compaction: compactions[0],
+    ...(responseId ? { responseId } : {}),
+    ...(tokenUsage ? { tokenUsage } : {}),
+    ...(turnState ? { turnState } : {}),
+  };
 }
 
 export function buildReplacementHistory(
   requestInput: ResponseItem[],
   compaction: ResponseItem,
 ): ResponseItem[] {
-  const retained: ResponseItem[] = [];
-  let estimatedTokens = 0;
-  for (const item of requestInput.slice(0, -1).reverse()) {
-    const role = item.role;
-    if (role !== "user" && role !== "developer" && role !== "system") continue;
-    const itemTokens = Math.ceil(JSON.stringify(item).length / 4);
-    if (estimatedTokens + itemTokens > 64_000) break;
-    retained.push(item);
-    estimatedTokens += itemTokens;
+  const source =
+    requestInput.at(-1)?.type === "compaction_trigger"
+      ? requestInput.slice(0, -1)
+      : requestInput;
+  const candidates = source
+    .filter(isRetainedHistoryItem);
+  const retainedReversed: ResponseItem[] = [];
+  let remainingTokens = RETAINED_HISTORY_TOKEN_BUDGET;
+
+  // Codex keeps the newest retained messages first, then restores their
+  // original order. This preserves the active tail when the transcript is
+  // larger than the 64k replacement-history budget.
+  for (let index = candidates.length - 1; index >= 0; index--) {
+    const item = candidates[index];
+    const itemTokens = estimateItemTokens(item);
+    if (itemTokens <= remainingTokens) {
+      retainedReversed.push(item);
+      remainingTokens -= Math.max(1, itemTokens);
+      continue;
+    }
+
+    const truncated = truncateRetainedMessage(item, remainingTokens);
+    if (truncated) {
+      retainedReversed.push(truncated);
+      remainingTokens = 0;
+    }
+    break;
   }
-  retained.reverse();
+
+  const retained = retainedReversed.reverse();
   retained.push(compaction);
   return retained;
+}
+
+function estimateItemTokens(item: unknown): number {
+  const textTokens = textTokenCount(item);
+  const nonTextShape = withoutTextContent(item);
+  const nonTextTokens = Math.ceil(
+    Buffer.byteLength(stableJson(nonTextShape), "utf8") / 4,
+  );
+  return Math.max(1, textTokens + nonTextTokens);
+}
+
+function approximateTextTokens(value: string): number {
+  return Math.ceil(Buffer.byteLength(value, "utf8") / 4);
+}
+
+function isTextContentKey(key: string): boolean {
+  return key === "text" || key === "content";
+}
+
+function textTokenCount(value: unknown, textContent = false): number {
+  if (typeof value === "string") {
+    return textContent ? approximateTextTokens(value) : 0;
+  }
+  if (Array.isArray(value)) {
+    return value.reduce(
+      (total, entry) => total + textTokenCount(entry, textContent),
+      0,
+    );
+  }
+  if (!value || typeof value !== "object") return 0;
+  return Object.entries(value as Record<string, unknown>).reduce(
+    (total, [key, entry]) =>
+      total + textTokenCount(entry, isTextContentKey(key)),
+    0,
+  );
+}
+
+function withoutTextContent(value: unknown, textContent = false): unknown {
+  if (typeof value === "string") return textContent ? "" : value;
+  if (Array.isArray(value)) {
+    return value.map((entry) => withoutTextContent(entry, textContent));
+  }
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+      key,
+      withoutTextContent(entry, isTextContentKey(key)),
+    ]),
+  );
+}
+
+function isRetainedHistoryItem(item: ResponseItem): boolean {
+  const type = typeof item.type === "string" ? item.type : undefined;
+  if (type === "compaction" || type === "context_compaction") return true;
+  if (type === "agent_message" || type === "agent") {
+    return !isFinalAgentMessage(item) &&
+      estimateItemTokens(item) <= MAX_RETAINED_AGENT_MESSAGE_TOKENS;
+  }
+  if (type === "message" && item.role === "assistant") {
+    return !isFinalAgentMessage(item) &&
+      estimateItemTokens(item) <= MAX_RETAINED_AGENT_MESSAGE_TOKENS;
+  }
+  if (type !== undefined && type !== "message") return false;
+  return (
+    item.role === "user" ||
+    item.role === "developer" ||
+    item.role === "system"
+  );
+}
+
+function isFinalAgentMessage(item: ResponseItem): boolean {
+  const content = item.content;
+  if (!Array.isArray(content)) return false;
+  const first = content[0];
+  const text =
+    first && typeof first === "object" && typeof (first as any).text === "string"
+      ? (first as any).text
+      : undefined;
+  return text?.startsWith("Message Type: FINAL_ANSWER\n") ?? false;
+}
+
+function truncateTextToApproximateTokens(
+  text: string,
+  tokenBudget: number,
+): string | undefined {
+  if (tokenBudget <= 0) return undefined;
+  if (approximateTextTokens(text) <= tokenBudget) return text;
+
+  // truncateCodexText's marker is intentionally outside its payload budget.
+  // Binary-search the byte budget so the complete marked result, not only its
+  // retained halves, fits this approximate token allowance.
+  let lower = 0;
+  let upper = Math.min(
+    Buffer.byteLength(text, "utf8"),
+    tokenBudget * 4,
+  );
+  let best: string | undefined;
+  while (lower <= upper) {
+    const midpoint = Math.floor((lower + upper) / 2);
+    const candidate = truncateCodexText(text, {
+      type: "bytes",
+      limit: midpoint,
+    });
+    if (approximateTextTokens(candidate) <= tokenBudget) {
+      best = candidate;
+      lower = midpoint + 1;
+    } else {
+      upper = midpoint - 1;
+    }
+  }
+  return best;
+}
+
+function truncateRetainedMessage(
+  item: ResponseItem,
+  remainingTokens: number,
+): ResponseItem | undefined {
+  if (remainingTokens <= 0) return undefined;
+  const copy = structuredClone(item);
+  const fixedTokens = Math.max(
+    1,
+    Math.ceil(
+      Buffer.byteLength(stableJson(withoutTextContent(copy)), "utf8") / 4,
+    ),
+  );
+  if (fixedTokens >= remainingTokens) return undefined;
+  let remaining = remainingTokens - fixedTokens;
+  let changed = false;
+
+  const consumeText = (text: string): string | undefined => {
+    if (remaining <= 0) return undefined;
+    const tokens = approximateTextTokens(text);
+    if (tokens <= remaining) {
+      remaining -= tokens;
+      return text;
+    }
+    const truncated = truncateTextToApproximateTokens(text, remaining);
+    if (!truncated) return undefined;
+    remaining -= approximateTextTokens(truncated);
+    return truncated || undefined;
+  };
+
+  const visit = (value: unknown, textContent = false): unknown => {
+    if (typeof value === "string") {
+      if (!textContent) return value;
+      changed = true;
+      return consumeText(value);
+    }
+    if (Array.isArray(value)) {
+      const next: unknown[] = [];
+      for (const entry of value) {
+        const visited = visit(entry, textContent);
+        if (visited !== undefined) next.push(visited);
+      }
+      return next;
+    }
+    if (!value || typeof value !== "object") return value;
+    const next: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      const textContent = isTextContentKey(key);
+      const visited = visit(entry, textContent);
+      if (
+        visited === undefined &&
+        textContent &&
+        typeof entry === "string"
+      ) {
+        return undefined;
+      }
+      if (visited !== undefined) next[key] = visited;
+    }
+    return next;
+  };
+
+  const result = visit(copy);
+  if (!changed && estimateItemTokens(result) > remainingTokens) return undefined;
+  if (!result || typeof result !== "object") return undefined;
+  const originalContent = item.content;
+  const retainedContent = (result as ResponseItem).content;
+  if (
+    originalContent !== undefined &&
+    (retainedContent === undefined ||
+      (Array.isArray(originalContent) &&
+        Array.isArray(retainedContent) &&
+        retainedContent.length === 0))
+  ) {
+    return undefined;
+  }
+  if (estimateItemTokens(result) <= remainingTokens) {
+    return result as ResponseItem;
+  }
+  return undefined;
 }
 
 function itemContainsMarker(item: unknown, marker: string): boolean {
@@ -290,16 +734,60 @@ function itemContainsMarker(item: unknown, marker: string): boolean {
   return Object.values(item).some((entry) => itemContainsMarker(entry, marker));
 }
 
+function markerCount(item: unknown, marker: string): number {
+  if (typeof item === "string") {
+    return item.split(marker).length - 1;
+  }
+  if (Array.isArray(item)) {
+    return item.reduce((count, entry) => count + markerCount(entry, marker), 0);
+  }
+  if (!item || typeof item !== "object") return 0;
+  return Object.values(item).reduce(
+    (count, entry) => count + markerCount(entry, marker),
+    0,
+  );
+}
+
 export function installRemoteCheckpoint(
   payload: unknown,
   details: RemoteCompactionDetails,
+  expected?: { toolCatalogFingerprint?: string; contextFingerprint?: string },
 ): unknown {
   if (!payload || typeof payload !== "object") return payload;
+  if (
+    details.version === REMOTE_COMPACTION_VERSION &&
+    (!details.toolCatalogFingerprint ||
+      !expected?.toolCatalogFingerprint)
+  ) return payload;
+  if (
+    details.version === REMOTE_COMPACTION_VERSION &&
+    details.contextFingerprint &&
+    !expected?.contextFingerprint
+  ) return payload;
+  if (
+    expected?.toolCatalogFingerprint &&
+    details.toolCatalogFingerprint &&
+    expected.toolCatalogFingerprint !== details.toolCatalogFingerprint
+  ) return payload;
+  if (
+    expected?.contextFingerprint &&
+    details.contextFingerprint &&
+    expected.contextFingerprint !== details.contextFingerprint
+  ) return payload;
   const body = payload as { input?: unknown[] };
   if (!Array.isArray(body.input)) return payload;
   const marker = checkpointMarker(details.checkpointId);
-  const index = body.input.findIndex((item) => itemContainsMarker(item, marker));
-  if (index < 0) return payload;
+  const matchingIndexes = body.input.flatMap((item, index) =>
+    itemContainsMarker(item, marker) ? [index] : [],
+  );
+  // A checkpoint is stale when its marker is no longer present. Never replace
+  // an unrelated request, preserving Subrouter and legacy session behavior.
+  if (
+    matchingIndexes.length !== 1 ||
+    markerCount(body.input[matchingIndexes[0]], marker) !== 1 ||
+    details.output.length === 0
+  ) return payload;
+  const index = matchingIndexes[0];
   body.input.splice(index, 1, ...details.output);
   return payload;
 }

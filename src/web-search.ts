@@ -1,5 +1,4 @@
 import type { Model } from "@earendil-works/pi-ai";
-import { truncateHead } from "@earendil-works/pi-coding-agent";
 import { extractChatGptAccountId } from "./remote-compaction.ts";
 
 export type WebSearchQuery = {
@@ -45,8 +44,11 @@ export type WebSearchResponse = {
 export type WebSearchDetails = {
   commands: WebSearchCommands;
   endpoint: string;
+  rawOutput: string;
   results?: unknown[];
 };
+
+export const WEB_SEARCH_DETAILS_LIMIT_BYTES = 50_000;
 
 export function resolveWebSearchUrl(baseUrl?: string): string {
   const raw = baseUrl?.trim() || "https://chatgpt.com/backend-api";
@@ -58,11 +60,18 @@ export function resolveWebSearchUrl(baseUrl?: string): string {
 
 export function buildWebSearchHeaders(
   token: string,
-  modelHeaders?: Record<string, string>,
-  authHeaders?: Record<string, string>,
+  modelHeaders?: Record<string, string | null>,
+  authHeaders?: Record<string, string | null>,
 ): Headers {
-  const headers = new Headers(modelHeaders);
-  for (const [name, value] of Object.entries(authHeaders ?? {})) headers.set(name, value);
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(modelHeaders ?? {})) {
+    if (value == null) headers.delete(name);
+    else headers.set(name, value);
+  }
+  for (const [name, value] of Object.entries(authHeaders ?? {})) {
+    if (value == null) headers.delete(name);
+    else headers.set(name, value);
+  }
   headers.set("authorization", `Bearer ${token}`);
   if (!headers.has("chatgpt-account-id")) {
     headers.set("chatgpt-account-id", extractChatGptAccountId(token));
@@ -129,7 +138,7 @@ export async function fetchCodexWebSearch(options: {
   endpoint: string;
   token: string;
   model: Model<any>;
-  authHeaders?: Record<string, string>;
+  authHeaders?: Record<string, string | null>;
   commands: WebSearchCommands;
   sessionId: string;
   input?: Array<Record<string, unknown>>;
@@ -142,7 +151,7 @@ export async function fetchCodexWebSearch(options: {
     method: "POST",
     headers: buildWebSearchHeaders(
       options.token,
-      options.model.headers as Record<string, string> | undefined,
+      options.model.headers as Record<string, string | null> | undefined,
       options.authHeaders,
     ),
     body: JSON.stringify({
@@ -176,7 +185,9 @@ export async function fetchCodexWebSearch(options: {
   }
 
   return {
-    text: truncateHead(payload.output, { maxLines: 2_000, maxBytes: 50 * 1024 }).content,
+    // Keep the provider response intact. Codex's output policy belongs at the
+    // model boundary, where the caller can preserve raw details separately.
+    text: payload.output,
     response: payload,
   };
 }
@@ -192,4 +203,16 @@ export function summarizeWebSearchCommands(commands: WebSearchCommands): string 
   if (commands.sports?.length) return `${commands.sports[0].league} ${commands.sports[0].fn}`;
   if (commands.time?.length) return `time ${commands.time[0].utc_offset}`;
   return "web";
+}
+
+export function boundedWebSearchDetails(text: string): string {
+  if (Buffer.byteLength(text, "utf8") <= WEB_SEARCH_DETAILS_LIMIT_BYTES) {
+    return text;
+  }
+  const suffix = "\n… raw output truncated …";
+  const budget = WEB_SEARCH_DETAILS_LIMIT_BYTES - Buffer.byteLength(suffix, "utf8");
+  const source = Buffer.from(text, "utf8");
+  let end = budget;
+  while (end > 0 && (source[end] & 0xc0) === 0x80) end--;
+  return `${source.subarray(0, end).toString("utf8")}${suffix}`;
 }

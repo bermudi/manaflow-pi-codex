@@ -7,6 +7,7 @@ import { StringEnum, type Model } from "@earendil-works/pi-ai";
 import {
   renderDiff,
   SettingsManager,
+  type ToolDefinition,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -20,21 +21,37 @@ import {
   buildCompactRequest,
   buildReplacementHistory,
   checkpointMarker,
+  convertCodexTools,
+  fingerprintContext,
   fetchRemoteCompaction,
+  fingerprintCheckpointSuffix,
   installRemoteCheckpoint,
   isRemoteCompactionDetails,
   parseRemoteCompactionSse,
+  retainedContextItems,
+  REMOTE_COMPACTION_VERSION,
+  toPiUsage,
   type RemoteCompactionDetails,
   resolveCompactUrl,
 } from "../src/remote-compaction.ts";
 import {
   buildWebSearchInput,
+  boundedWebSearchDetails,
   fetchCodexWebSearch,
   resolveWebSearchUrl,
   summarizeWebSearchCommands,
   type WebSearchCommands,
   type WebSearchDetails,
 } from "../src/web-search.ts";
+import {
+  ToolContractRegistry,
+  fingerprintToolSpecs,
+} from "../src/tool-contract.ts";
+import {
+  CODEX_DEFAULT_OUTPUT_BUDGET_BYTES,
+  resolveCodexTruncationPolicy,
+  truncateCodexOutput,
+} from "../src/output-truncation.ts";
 
 const grammarPath = fileURLToPath(new URL("../src/apply-patch.lark", import.meta.url));
 const applyPatchGrammar = readFileSync(grammarPath, "utf8");
@@ -102,8 +119,22 @@ function installCompactCompactionRenderer() {
   Object.defineProperty(prototype, compactRendererMarker, { value: true });
 }
 
-function isOpenAICodexModel(model: Model<any> | undefined): boolean {
-  return model?.provider === "openai-codex";
+function isOpenAICodexModel(model: Model<any> | undefined): model is Model<any> {
+  // Codex-compatible providers can be local/subrouter aliases while still
+  // speaking the OpenAI Responses protocol. This controls Codex tool behavior;
+  // remote compaction has a narrower capability check below.
+  return model?.provider === "openai-codex" || model?.api === "openai-codex-responses";
+}
+
+function supportsCodexRemoteCompaction(
+  model: Model<any> | undefined,
+): model is Model<any> {
+  if (!isOpenAICodexModel(model)) return false;
+  const declared =
+    (model as any).supportsRemoteCompaction ??
+    (model.compat as any)?.supportsRemoteCompaction;
+  if (typeof declared === "boolean") return declared;
+  return model.provider === "openai-codex" || model.provider === "subrouter";
 }
 
 function isCodexSolModel(model: Model<any> | undefined): boolean {
@@ -235,7 +266,11 @@ type ApplyPatchDetails = {
 };
 
 function isCodexModel(model: Model<any> | undefined): boolean {
-  return model?.provider === "openai-codex" || /(?:^|[-_.])codex(?:$|[-_.])/.test(model?.id ?? "");
+  // Tool selection follows the wire protocol first. A subrouter alias may
+  // expose the Codex Responses API without containing "codex" in its name.
+  const modelId = model?.id ?? "";
+  return isOpenAICodexModel(model) ||
+    /(?:^|[-_.])codex(?:$|[-_.])/.test(modelId);
 }
 
 function changedPathsFromOutput(output: string): string[] {
@@ -299,10 +334,77 @@ export default function piCodex(pi: ExtensionAPI) {
   let applyPatchSelected: boolean | undefined;
   let webSearchSelected: boolean | undefined;
   let retryTurnState: string | undefined;
+  let turnState: string | undefined;
   let fastModeEnabled = true;
   let workingStartedAt: number | undefined;
   let workingTimer: ReturnType<typeof setInterval> | undefined;
   const removedForCodex = new Set<string>();
+  const toolContracts = new ToolContractRegistry();
+  let activeToolCatalogFingerprint = "";
+
+  // Codex's model_visible_specs() contains direct tools only. Deferred
+  // contracts stay registered for Pi's tool-search lifecycle and are included
+  // in the catalog fingerprint, but must not be sent in the initial
+  // compaction request.
+  function activeCodexToolSpecs(includeDeferred = false) {
+    return pi
+      .getAllTools()
+      .filter((tool) => pi.getActiveTools().includes(tool.name))
+      .flatMap((tool) => {
+        const contract = toolContracts.get(tool.name);
+        if (contract?.exposure === "hidden") return [];
+        if (contract && !contract.isDirect() && !includeDeferred) return [];
+        const contractTool = contract?.toCodexTool();
+        return [contractTool ?? {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters,
+          ...((tool as any).constrainedSampling
+            ? { constrainedSampling: (tool as any).constrainedSampling }
+            : {}),
+        }];
+      });
+  }
+
+  function activeCodexToolFingerprint(model: Model<any> | undefined): string {
+    const tools = activeCodexToolSpecs();
+    const deferredTools = activeCodexToolSpecs(true).filter(
+      (tool) => !tools.some((direct) => direct.name === tool.name),
+    );
+    const directWireTools = model
+      ? convertCodexTools(model, tools) ?? tools
+      : tools;
+    const deferredWireTools = model
+      ? convertCodexTools(model, deferredTools) ?? deferredTools
+      : deferredTools;
+    return fingerprintToolSpecs([
+      ...directWireTools,
+      {
+        name: "__pi_codex_deferred_tools__",
+        tools: deferredWireTools,
+      },
+      {
+        name: "__pi_codex_model_compat__",
+        provider: model?.provider,
+        model: model?.id,
+        api: model?.api,
+        contextWindow: model?.contextWindow,
+        supportsStrictMode: (model?.compat as any)?.supportsStrictMode,
+        supportsOpenAIGrammarTools: (model?.compat as any)?.supportsOpenAIGrammarTools,
+        supportsToolSearch: (model?.compat as any)?.supportsToolSearch,
+      },
+    ]);
+  }
+
+  function outputPolicy(model: Model<any> | undefined, budget: number) {
+    return budget === CODEX_DEFAULT_OUTPUT_BUDGET_BYTES
+      ? resolveCodexTruncationPolicy(model)
+      : { type: "bytes" as const, limit: budget };
+  }
+
+  function truncationUnits(text: string): number {
+    return Buffer.byteLength(text, "utf8");
+  }
 
   function latestRemoteCompaction(ctx: { sessionManager: { getBranch(): readonly any[] } }) {
     return [...ctx.sessionManager.getBranch()]
@@ -422,7 +524,7 @@ export default function piCodex(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  const webSearchDefinition: ToolDefinition<typeof webSearchSchema> = {
     name: "web_search",
     label: "Web Search",
     description:
@@ -449,17 +551,22 @@ export default function piCodex(pi: ExtensionAPI) {
         endpoint,
         token: auth.apiKey,
         model,
-        authHeaders: auth.headers,
+        authHeaders: auth.headers as Record<string, string | null> | undefined,
         commands: commands as WebSearchCommands,
         sessionId: ctx.sessionManager.getSessionId(),
         input,
         signal,
       });
+      const modelOutput = truncateCodexOutput(
+        result.text,
+        outputPolicy(model, webSearchContract.outputBudgetBytes),
+      );
       return {
-        content: [{ type: "text", text: result.text }],
+        content: [{ type: "text", text: modelOutput.content }],
         details: {
           commands,
           endpoint,
+          rawOutput: boundedWebSearchDetails(result.text),
           results: result.response.results,
         } satisfies WebSearchDetails,
       };
@@ -473,16 +580,29 @@ export default function piCodex(pi: ExtensionAPI) {
       );
     },
     renderResult(result, { expanded }, theme, { isError }) {
-      const output = result.content
-        .map((item) => (item.type === "text" ? item.text : ""))
-        .join("\n");
+      const rawOutput = (result.details as WebSearchDetails | undefined)?.rawOutput;
+      const output =
+        expanded && rawOutput
+          ? rawOutput
+          : result.content
+              .map((item) => (item.type === "text" ? item.text : ""))
+              .join("\n");
       const visible =
         expanded || output.length <= 2_000 ? output : `${output.slice(0, 2_000).trimEnd()}\n…`;
       return new Text(theme.fg(isError ? "error" : "toolOutput", visible), 0, 0);
     },
+  };
+  const webSearchContract = toolContracts.register(webSearchDefinition, {
+    exposure: "direct",
+    namespace: "web",
+    search: { namespace: "web", keywords: ["browse", "search", "current information"] },
+    schemaVersion: "1",
+    capabilities: ["network", "external_context"],
+    outputBudgetBytes: CODEX_DEFAULT_OUTPUT_BUDGET_BYTES,
   });
+  pi.registerTool(webSearchContract.definition);
 
-  pi.registerTool({
+  const applyPatchDefinition: ToolDefinition<typeof applyPatchSchema> = {
     name: "apply_patch",
     label: "Apply Patch",
     description:
@@ -515,9 +635,16 @@ export default function piCodex(pi: ExtensionAPI) {
       const output = [result.stdout.trimEnd(), result.stderr.trimEnd()]
         .filter(Boolean)
         .join("\n");
+      const rawModelOutput = result.code === 0
+        ? output || "Patch applied successfully."
+        : output || `Codex apply_patch exited with status ${result.code}`;
+      const modelOutput = truncateCodexOutput(
+        rawModelOutput,
+        outputPolicy(ctx.model, applyPatchContract.outputBudgetBytes),
+      );
 
       if (result.code !== 0) {
-        throw new Error(output || `Codex apply_patch exited with status ${result.code}`);
+        throw new Error(modelOutput.content);
       }
 
       const changedPaths = changedPathsFromOutput(result.stdout);
@@ -534,7 +661,7 @@ export default function piCodex(pi: ExtensionAPI) {
       ).filter((diff): diff is { path: string; diff: string } => diff !== undefined);
 
       return {
-        content: [{ type: "text", text: output || "Patch applied successfully." }],
+        content: [{ type: "text", text: modelOutput.content }],
         details: {
           patch,
           output,
@@ -571,6 +698,75 @@ export default function piCodex(pi: ExtensionAPI) {
         : result.content.map((item) => (item.type === "text" ? item.text : "")).join("\n");
       return new Text(theme.fg(isError ? "error" : "success", text), 0, 0);
     },
+  };
+  const applyPatchContract = toolContracts.register(applyPatchDefinition, {
+    exposure: "direct",
+    namespace: "coding",
+    search: { namespace: "coding", keywords: ["edit", "write", "patch", "files"] },
+    schemaVersion: "1",
+    capabilities: ["filesystem", "mutation"],
+    parallelism: "sequential",
+    outputBudgetBytes: CODEX_DEFAULT_OUTPUT_BUDGET_BYTES,
+  });
+  pi.registerTool(applyPatchContract.definition);
+
+  // Codex applies one model-facing output policy to every tool executor. Pi
+  // exposes this as a post-execution hook, so package-owned tools can retain
+  // their raw details while built-in and third-party tools receive the same
+  // middle truncation before their result enters the next model request.
+  pi.on("tool_result", (event, ctx) => {
+    if (!isOpenAICodexModel(ctx.model)) return;
+    if (toolContracts.get(event.toolName)) return;
+    const policy = resolveCodexTruncationPolicy(ctx.model);
+    const textIndexes = event.content.flatMap((item: any, index: number) =>
+      item.type === "text" && typeof item.text === "string" ? [index] : [],
+    );
+    const units = textIndexes.map((index) =>
+      truncationUnits((event.content[index] as any).text),
+    );
+    const totalUnits = units.reduce((total, value) => total + value, 0);
+    if (totalUnits <= policy.limit) return;
+
+    // Retain the leading and trailing halves across all text slots. Each slot
+    // stays on its original side of images or audio, so truncation cannot move
+    // a later caption or question ahead of its associated attachment.
+    const front = Array(units.length).fill(0) as number[];
+    const back = Array(units.length).fill(0) as number[];
+    let frontRemaining = Math.floor(policy.limit / 2);
+    for (let index = 0; index < units.length && frontRemaining > 0; index++) {
+      front[index] = Math.min(units[index], frontRemaining);
+      frontRemaining -= front[index];
+    }
+    let backRemaining = policy.limit - Math.floor(policy.limit / 2);
+    for (let index = units.length - 1; index >= 0 && backRemaining > 0; index--) {
+      const available = units[index] - front[index];
+      back[index] = Math.min(available, backRemaining);
+      backRemaining -= back[index];
+    }
+    const allocations = new Map(
+      textIndexes.map((contentIndex, textIndex) => [
+        contentIndex,
+        front[textIndex] + back[textIndex],
+      ]),
+    );
+    const content = event.content.flatMap((item: any, index: number) => {
+      const limit = allocations.get(index);
+      if (limit === undefined) return [item];
+      if (limit === 0) return [];
+      return [{
+        ...item,
+        text: truncateCodexOutput(item.text, {
+          type: policy.type,
+          limit,
+        }).content,
+      }];
+    });
+    return {
+      content,
+      details: event.details,
+      isError: event.isError,
+      usage: event.usage,
+    };
   });
 
   // Steering is model-independent. Make an interruption additive by default
@@ -611,7 +807,7 @@ export default function piCodex(pi: ExtensionAPI) {
 
   pi.on("session_before_compact", async (event, ctx) => {
     const model = ctx.model;
-    if (!model || model.provider !== "openai-codex") return;
+    if (!supportsCodexRemoteCompaction(model)) return;
 
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (!auth.ok || !auth.apiKey) {
@@ -626,6 +822,7 @@ export default function piCodex(pi: ExtensionAPI) {
     ];
     const endpoint = resolveCompactUrl(providerAuth?.auth.baseUrl ?? model.baseUrl);
     const checkpointId = randomUUID();
+    activeToolCatalogFingerprint = activeCodexToolFingerprint(model);
     const body = buildCompactRequest({
       model,
       messages,
@@ -638,29 +835,14 @@ export default function piCodex(pi: ExtensionAPI) {
         fastModeEnabled && supportsCodexFastMode(model)
           ? CODEX_FAST_SERVICE_TIER
           : undefined,
-      tools: pi
-        .getAllTools()
-        .filter((tool) => pi.getActiveTools().includes(tool.name))
-        .map((tool) => ({
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.parameters,
-          ...(tool.name === "apply_patch"
-            ? {
-                constrainedSampling: {
-                  type: "grammar" as const,
-                  variants: { openai_lark: applyPatchGrammar },
-                },
-              }
-            : {}),
-        })),
+      tools: activeCodexToolSpecs(),
     });
     const { response, text: responseText } = await fetchRemoteCompaction(endpoint, {
       method: "POST",
       headers: buildCompactHeaders(
         auth.apiKey,
-        model.headers as Record<string, string> | undefined,
-        auth.headers,
+        model.headers as Record<string, string | null> | undefined,
+        auth.headers as Record<string, string | null> | undefined,
       ),
       body: JSON.stringify(body),
       signal: event.signal,
@@ -671,8 +853,19 @@ export default function piCodex(pi: ExtensionAPI) {
       );
     }
 
-    const { compaction } = parseRemoteCompactionSse(responseText);
+    const parsedCompaction = parseRemoteCompactionSse(responseText);
+    const { compaction } = parsedCompaction;
     const output = buildReplacementHistory(body.input, compaction);
+    const retainedContext = retainedContextItems(
+      model,
+      ctx.sessionManager.getBranch(),
+      event.preparation.firstKeptEntryId,
+    );
+    if (!retainedContext) {
+      throw new Error(
+        "Codex remote compaction could not establish the retained session context",
+      );
+    }
 
     const modifiedFiles = new Set([
       ...event.preparation.fileOps.written,
@@ -683,44 +876,92 @@ export default function piCodex(pi: ExtensionAPI) {
     );
     const details: RemoteCompactionDetails = {
       type: "pi-codex-remote-compaction",
-      version: 1,
+      version: REMOTE_COMPACTION_VERSION,
       checkpointId,
       endpoint,
       output: output as Record<string, unknown>[],
       readFiles,
       modifiedFiles: [...modifiedFiles],
+      responseId: parsedCompaction.responseId,
+      turnState:
+        response.headers.get("x-codex-turn-state") ??
+        parsedCompaction.turnState,
+      toolCatalogFingerprint: activeToolCatalogFingerprint,
+      contextFingerprint: fingerprintContext(retainedContext),
+      retainedContextItemCount: retainedContext.length,
+      retainedHistoryVersion: "codex-responses-v2",
+      tokenUsage: parsedCompaction.tokenUsage,
     };
-    retryTurnState = event.willRetry
-      ? response.headers.get("x-codex-turn-state") ?? undefined
-      : undefined;
+    const responseTurnState =
+      response.headers.get("x-codex-turn-state") ??
+      parsedCompaction.turnState;
+    if (responseTurnState) turnState = responseTurnState;
+    retryTurnState = event.willRetry ? responseTurnState : undefined;
 
     return {
       compaction: {
         summary: checkpointMarker(checkpointId),
         firstKeptEntryId: event.preparation.firstKeptEntryId,
         tokensBefore: event.preparation.tokensBefore,
+        ...(parsedCompaction.tokenUsage
+          ? { usage: toPiUsage(parsedCompaction.tokenUsage) }
+          : {}),
         details,
       },
     };
   });
 
   pi.on("before_provider_request", (event, ctx) => {
-    if (ctx.model?.provider !== "openai-codex") return;
+    if (!isOpenAICodexModel(ctx.model)) return;
     if (fastModeEnabled && supportsCodexFastMode(ctx.model)) {
       (event.payload as Record<string, unknown>).service_tier = CODEX_FAST_SERVICE_TIER;
     }
     const details = latestRemoteCompaction(ctx);
-    if (details) return installRemoteCheckpoint(event.payload, details);
+    if (details) {
+      const currentToolCatalogFingerprint = activeCodexToolFingerprint(ctx.model);
+      const input = ((event.payload as any)?.input ?? []) as readonly unknown[];
+      const expectedContextFingerprint =
+        details.contextFingerprint && details.retainedContextItemCount !== undefined
+          ? fingerprintCheckpointSuffix(
+              input,
+              checkpointMarker(details.checkpointId),
+              details.retainedContextItemCount,
+            )
+          : undefined;
+      return installRemoteCheckpoint(event.payload, details, {
+        toolCatalogFingerprint: currentToolCatalogFingerprint,
+        ...(expectedContextFingerprint
+          ? { contextFingerprint: expectedContextFingerprint }
+          : {}),
+      });
+    }
   });
 
   pi.on("before_provider_headers", (event, ctx) => {
-    if (ctx.model?.provider === "openai-codex" && retryTurnState) {
-      event.headers["x-codex-turn-state"] = retryTurnState;
-    }
+    if (!isOpenAICodexModel(ctx.model)) return;
+    const state = retryTurnState ?? turnState;
+    if (state) event.headers["x-codex-turn-state"] = state;
+  });
+
+  pi.on("after_provider_response", (event, ctx) => {
+    if (!isOpenAICodexModel(ctx.model)) return;
+    const headers = event.headers ?? {};
+    const state =
+      headers["x-codex-turn-state"] ??
+      headers["X-Codex-Turn-State"];
+    if (state) turnState ??= state;
   });
 
   pi.on("agent_end", () => {
     retryTurnState = undefined;
+  });
+  pi.on("turn_start", () => {
+    retryTurnState = undefined;
+    turnState = undefined;
+  });
+  pi.on("turn_end", () => {
+    retryTurnState = undefined;
+    turnState = undefined;
   });
   pi.on("agent_start", (_event, ctx) => {
     startWorkingTicker(ctx);
@@ -729,6 +970,8 @@ export default function piCodex(pi: ExtensionAPI) {
     stopWorkingTicker(ctx);
   });
   pi.on("session_start", (_event, ctx) => {
+    retryTurnState = undefined;
+    turnState = undefined;
     restoreFastMode(ctx);
     syncTools(ctx.model);
     updateFastModeStatus(ctx);

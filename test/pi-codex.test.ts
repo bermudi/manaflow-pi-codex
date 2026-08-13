@@ -49,16 +49,37 @@ import {
   resolveCodexExecutable,
 } from "../src/codex-binary.ts";
 import {
+  buildReplacementHistory,
+  buildCompactRequest,
   checkpointMarker,
+  fingerprintCheckpointInput,
+  fingerprintCheckpointSuffix,
+  installRemoteCheckpoint,
+  isRemoteCompactionDetails,
+  parseRemoteCompactionSse,
   resolveCompactUrl,
 } from "../src/remote-compaction.ts";
+import {
+  CODEX_DEFAULT_OUTPUT_BUDGET_BYTES,
+  formatCodexTruncatedOutput,
+  resolveCodexTruncationPolicy,
+  truncateCodexText,
+  truncateCodexOutput,
+} from "../src/output-truncation.ts";
+import {
+  ToolContractRegistry,
+  createToolContract,
+  fingerprintToolCatalog,
+} from "../src/tool-contract.ts";
+import { Type } from "typebox";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   buildWebSearchHeaders,
   resolveWebSearchUrl,
   summarizeWebSearchCommands,
 } from "../src/web-search.ts";
 
-function run(executable: string, args: string[], cwd: string) {
+function run(executable: string, args: string[], cwd: string, input?: string) {
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn(executable, args, { cwd });
     let stdout = "";
@@ -67,6 +88,7 @@ function run(executable: string, args: string[], cwd: string) {
     child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
     child.on("error", reject);
     child.on("close", (code) => resolve({ code, stdout, stderr }));
+    if (input !== undefined) child.stdin.end(input);
   });
 }
 
@@ -392,9 +414,43 @@ test("uses the upstream freeform apply_patch grammar", () => {
   assert.match(applyPatchGrammar, /eof_line: "\*\*\* End of File" LF/);
 });
 
+test("pi-codex loads when Pi starts outside the package directory", async () => {
+  const projectRoot = join(import.meta.dirname, "..");
+  const result = await run(
+    process.execPath,
+    [
+      join(
+        projectRoot,
+        "node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+      ),
+      "--mode",
+      "rpc",
+      "--no-session",
+      "--no-extensions",
+      "--no-skills",
+      "--no-context-files",
+      "--extension",
+      join(projectRoot, "extensions/pi-codex.ts"),
+      "--offline",
+    ],
+    tmpdir(),
+    `${JSON.stringify({ id: "state", type: "get_state" })}\n`,
+  );
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /"command":"get_state","success":true/);
+});
+
 test("recognizes Codex models", () => {
   assert.equal(isCodexModel({ provider: "openai-codex", id: "gpt-5.6-sol" } as never), true);
   assert.equal(isCodexModel({ provider: "openai", id: "gpt-5.3-codex" } as never), true);
+  assert.equal(
+    isCodexModel({
+      provider: "subrouter",
+      id: "gpt-5.6-sol",
+      api: "openai-codex-responses",
+    } as never),
+    true,
+  );
   assert.equal(isCodexModel({ provider: "openai", id: "gpt-5.4" } as never), false);
   assert.equal(
     supportsCodexFastMode({ provider: "openai-codex", id: "gpt-5.6-sol" } as never),
@@ -534,6 +590,36 @@ test("standalone web search executes through the subrouter and renders as a Pi t
       renderedResult.render(120).join("\n"),
       /Search result with source https:\/\/example\.com/,
     );
+
+    const oversized = "x".repeat(60_000);
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ output: oversized }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const oversizedResult = await webSearch.execute(
+      "search-2",
+      { search_query: [{ q: "large result" }] },
+      new AbortController().signal,
+      undefined,
+      {
+        model,
+        modelRegistry: {
+          getApiKeyAndHeaders: async () => ({ ok: true, apiKey: token }),
+          getProviderAuth: async () => ({
+            auth: { baseUrl: "http://subrouter.test/backend-api" },
+          }),
+        },
+        sessionManager: {
+          getSessionId: () => "session-render",
+          getBranch: () => [],
+        },
+      },
+    );
+    assert.ok(
+      Buffer.byteLength(oversizedResult.details.rawOutput, "utf8") <= 50_000,
+      "persisted inspection output stays bounded",
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -648,6 +734,39 @@ test("swaps write tools only while a Codex model is selected", async () => {
   assert.equal(toolDefinition.constrainedSampling.type, "grammar");
   assert.deepEqual(toolDefinition.parameters.required, ["patch"]);
   assert.match(toolDefinition.promptGuidelines.join("\n"), /re-read the affected region/);
+  const multipartResult: any = handlers.get("tool_result")?.(
+    {
+      toolName: "bash",
+      content: [
+        { type: "text", text: "HEAD-" + "x".repeat(20_000) },
+        { type: "image", data: "image", mimeType: "image/png" },
+        { type: "text", text: "-TAIL" },
+      ],
+      details: { raw: true },
+      isError: false,
+    },
+    { model: { provider: "openai-codex", id: "gpt-5.6-sol" } },
+  );
+  assert.equal(multipartResult.content.length, 3);
+  assert.equal(multipartResult.content[0].type, "text");
+  assert.match(multipartResult.content[0].text, /HEAD-/);
+  assert.equal(multipartResult.content[1].type, "image");
+  assert.equal(multipartResult.content[2].type, "text");
+  assert.match(multipartResult.content[2].text, /-TAIL/);
+  assert.deepEqual(multipartResult.details, { raw: true });
+  const manyTextItems: any = handlers.get("tool_result")?.(
+    {
+      toolName: "bash",
+      content: Array.from({ length: 20_000 }, () => ({
+        type: "text",
+        text: "x",
+      })),
+      details: undefined,
+      isError: false,
+    },
+    { model: { provider: "openai-codex", id: "gpt-5.6-sol" } },
+  );
+  assert.ok(manyTextItems.content.length <= 10_000);
 
   await handlers.get("session_start")?.({}, {
     model: { provider: "openai-codex", id: "gpt-5.6-sol", contextWindow: 272_000 },
@@ -696,6 +815,9 @@ test("swaps write tools only while a Codex model is selected", async () => {
   const defaultFastPayload: any = {};
   handlers.get("before_provider_request")?.({ payload: defaultFastPayload }, fastCtx);
   assert.equal(defaultFastPayload.service_tier, "priority");
+  assert.doesNotThrow(() => {
+    handlers.get("after_provider_response")?.({ status: 200 }, fastCtx);
+  });
 
   await commands.get("fast").handler("off", fastCtx);
   const disabledFastPayload: any = {};
@@ -756,6 +878,43 @@ test("resolves the same Responses endpoint as current OpenAI Codex compaction v2
   );
 });
 
+test("remote compaction requires a provider that declares the capability", async () => {
+  const handlers = new Map<string, (...args: any[]) => any>();
+  const pi = {
+    registerCommand() {},
+    registerTool() {},
+    appendEntry() {},
+    getActiveTools: () => [],
+    getAllTools: () => [],
+    setActiveTools() {},
+    on(name: string, handler: (...args: any[]) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI;
+  piCodex(pi);
+
+  let authRequested = false;
+  const result = await handlers.get("session_before_compact")?.({
+    preparation: {},
+    signal: new AbortController().signal,
+  }, {
+    model: {
+      id: "local-codex",
+      provider: "local-responses",
+      api: "openai-codex-responses",
+    },
+    modelRegistry: {
+      async getApiKeyAndHeaders() {
+        authRequested = true;
+        return { ok: false, error: "remote compaction should not run" };
+      },
+    },
+  });
+
+  assert.equal(result, undefined);
+  assert.equal(authRequested, false);
+});
+
 test("remote compaction persists and reinstalls Codex replacement history", async () => {
   const handlers = new Map<string, (...args: any[]) => any>();
   const pi = {
@@ -795,7 +954,19 @@ test("remote compaction persists and reinstalls Codex replacement history", asyn
     requestedInit = init;
     const sse = [
       `data: ${JSON.stringify({ type: "response.output_item.done", item: replacement[0] })}`,
-      `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp-compact" } })}`,
+      `data: ${JSON.stringify({
+        type: "response.completed",
+        response: {
+          id: "resp-compact",
+          usage: {
+            input_tokens: 120,
+            output_tokens: 30,
+            total_tokens: 150,
+            input_tokens_details: { cached_tokens: 20, cache_write_tokens: 10 },
+            output_tokens_details: { reasoning_tokens: 12 },
+          },
+        },
+      })}`,
       "data: [DONE]",
       "",
     ].join("\n");
@@ -807,6 +978,17 @@ test("remote compaction persists and reinstalls Codex replacement history", asyn
 
   try {
     const branch: any[] = [];
+    branch.push({
+      type: "message",
+      id: "kept-entry",
+      parentId: null,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: "retained tail" }],
+        timestamp: 1,
+      },
+    });
     const ctx = {
       model,
       thinkingLevel: "medium",
@@ -850,17 +1032,364 @@ test("remote compaction persists and reinstalls Codex replacement history", asyn
     assert.deepEqual(body.input.at(-1), { type: "compaction_trigger" });
 
     const compaction = result.compaction;
+    assert.equal(compaction.usage.input, 90);
+    assert.equal(compaction.usage.output, 30);
+    assert.equal(compaction.usage.cacheRead, 20);
+    assert.equal(compaction.usage.cacheWrite, 10);
+    assert.equal(compaction.usage.reasoning, 12);
+    assert.equal(compaction.details.retainedContextItemCount, 1);
     assert.equal(compaction.details.output.at(-1).encrypted_content, "opaque-checkpoint");
     branch.push({ type: "compaction", details: compaction.details });
     const providerPayload: any = {
-      input: [{ role: "user", content: [{ type: "input_text", text: checkpointMarker(compaction.details.checkpointId) }] }],
+      input: [{
+        role: "user",
+        content: [{
+          type: "input_text",
+          text: checkpointMarker(compaction.details.checkpointId),
+        }],
+      }, {
+        role: "user",
+        content: [{ type: "input_text", text: "retained tail" }],
+      }],
     };
     handlers.get("before_provider_request")?.({ payload: providerPayload }, ctx);
     assert.equal(providerPayload.service_tier, "priority");
-    assert.deepEqual(providerPayload.input, compaction.details.output);
+    assert.deepEqual(
+      providerPayload.input,
+      [...compaction.details.output, providerPayload.input.at(-1)],
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("tool contracts preserve TypeBox schemas and Codex exposure metadata", () => {
+  const schema = Type.Object({ value: Type.String() });
+  const definition: ToolDefinition<typeof schema> = {
+    name: "contract_test",
+    label: "Contract Test",
+    description: "Test tool",
+    parameters: schema,
+    async execute() {
+      return { content: [{ type: "text" as const, text: "ok" }], details: undefined };
+    },
+  };
+  const direct = createToolContract(definition, {
+    exposure: "direct",
+    namespace: "test",
+    search: { keywords: ["example"] },
+    schemaVersion: "7",
+    capabilities: ["test"],
+    outputBudgetBytes: 123,
+  });
+  const deferred = direct.toCodexTool("deferred");
+  assert.equal(deferred?.defer_loading, true);
+  assert.equal(direct.isDirect(), true);
+  assert.equal(direct.isAvailableInCodeMode(), true);
+  const modelOnly = createToolContract(definition, {
+    exposure: "direct_model_only",
+  });
+  assert.equal(modelOnly.isDirect(), true);
+  assert.equal(modelOnly.isAvailableInCodeMode(), false);
+  assert.equal(modelOnly.toCodexTool()?.defer_loading, undefined);
+  assert.equal(direct.parameters, definition.parameters);
+  assert.equal(direct.snapshot().schemaVersion, "7");
+  assert.equal(direct.snapshot().outputBudgetBytes, 123);
+  assert.equal(direct.schemaHash.length, 64);
+  assert.equal(direct.toCodexTool("hidden"), undefined);
+
+  const registry = new ToolContractRegistry();
+  registry.register(definition, { exposure: "deferred" });
+  assert.deepEqual(registry.toCodexTools(), []);
+  assert.equal(registry.toCodexTools({ includeDeferred: true })[0].defer_loading, true);
+  assert.equal(fingerprintToolCatalog(registry.values()), registry.fingerprint());
+  assert.throws(
+    () => registry.register(definition),
+    /already registered/,
+  );
+});
+
+test("Codex output truncation is model-facing only and preserves both ends", () => {
+  const input = `HEAD-${"x".repeat(20_000)}-TAIL`;
+  const result = truncateCodexOutput(input);
+  assert.equal(CODEX_DEFAULT_OUTPUT_BUDGET_BYTES, 10_000);
+  assert.equal(result.truncated, true);
+  assert.match(result.content, /Warning: truncated output/);
+  assert.match(result.content, /Total output lines: 1/);
+  assert.match(result.content, /HEAD-/);
+  assert.match(result.content, /-TAIL$/);
+  assert.match(result.content, /chars truncated/);
+  assert.equal(truncateCodexOutput("short").content, "short");
+  assert.equal(
+    truncateCodexText("0123456789", { type: "bytes", limit: 4 }),
+    "01…6 chars truncated…89",
+  );
+  assert.match(
+    formatCodexTruncatedOutput("a\n", { type: "bytes", limit: 1 }).content,
+    /Total output lines: 1/,
+  );
+  const unicode = truncateCodexOutput("🙂".repeat(20), 10);
+  assert.equal(unicode.truncated, true);
+  assert.doesNotThrow(() => JSON.stringify(unicode.content));
+  assert.deepEqual(
+    resolveCodexTruncationPolicy({
+      compat: { truncationPolicy: { type: "tokens", limit: 1_000_000 } },
+    }),
+    { type: "bytes", limit: CODEX_DEFAULT_OUTPUT_BUDGET_BYTES },
+    "token policies require a provider tokenizer and must not use byte estimates",
+  );
+});
+
+test("compaction preserves Codex tool wire modalities and deferred exposure", () => {
+  const schema = Type.Object({ query: Type.String() });
+  const body = buildCompactRequest({
+    model: {
+      id: "gpt-5.6-sol",
+      compat: { supportsStrictMode: true, supportsOpenAIGrammarTools: false },
+      thinkingLevelMap: {},
+      input: ["text"],
+    } as never,
+    messages: [] as never,
+    instructions: "system",
+    tools: [
+      {
+        name: "deferred_search",
+        description: "Search",
+        parameters: schema,
+        defer_loading: true,
+      },
+    ],
+  });
+  assert.equal((body.tools as any[])[0].type, "function");
+  assert.equal((body.tools as any[])[0].defer_loading, true);
+  assert.equal((body.tools as any[])[0].strict, null);
+});
+
+test("compaction omits legacy function item ids when replaying custom tools", () => {
+  const callId = "call_NN4c5V7Onkj6YcXCXgijxyEs";
+  const legacyItemId =
+    "fc_01656a69efc78cad016a7d50b9d1f4819ba33c01fdfcd6bf52";
+  const toolCallId = `${callId}|${legacyItemId}`;
+  const usage = {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+    },
+  };
+  const body = buildCompactRequest({
+    model: {
+      id: "gpt-5.6-sol",
+      provider: "subrouter",
+      api: "openai-codex-responses",
+      input: ["text"],
+      reasoning: true,
+      compat: { supportsOpenAIGrammarTools: true },
+    } as never,
+    messages: [
+      {
+        role: "assistant",
+        content: [{
+          type: "toolCall",
+          id: toolCallId,
+          name: "apply_patch",
+          arguments: { patch: "*** Begin Patch\n*** End Patch" },
+        }],
+        api: "openai-codex-responses",
+        provider: "subrouter",
+        model: "gpt-5.5",
+        usage,
+        stopReason: "toolUse",
+        timestamp: 1,
+      },
+      {
+        role: "toolResult",
+        toolCallId,
+        toolName: "apply_patch",
+        content: [{ type: "text", text: "Done" }],
+        isError: false,
+        timestamp: 2,
+      },
+    ] as never,
+    instructions: "system",
+  });
+
+  const customCall = body.input.find(
+    (item) => item.type === "custom_tool_call",
+  );
+  assert.ok(customCall);
+  assert.equal("id" in customCall, false);
+  assert.equal(customCall.call_id, callId);
+  assert.ok(body.input.some(
+    (item) =>
+      item.type === "custom_tool_call_output" &&
+      item.call_id === callId,
+  ));
+});
+
+test("replacement history retains bounded assistant and oversized text messages", () => {
+  const compacted = { type: "compaction", encrypted_content: "opaque" };
+  const assistant = {
+    type: "message",
+    role: "assistant",
+    content: [{ type: "output_text", text: "intermediate answer" }],
+  };
+  assert.deepEqual(
+    buildReplacementHistory(
+      [assistant, { type: "compaction_trigger" }],
+      compacted,
+    ),
+    [assistant, compacted],
+  );
+
+  const oversized = {
+    type: "message",
+    role: "user",
+    content: "x".repeat(300_000),
+  };
+  const retained = buildReplacementHistory(
+    [oversized, { type: "compaction_trigger" }],
+    compacted,
+  );
+  assert.equal(retained.length, 2);
+  assert.equal(retained[0].role, "user");
+  assert.equal(typeof retained[0].content, "string");
+  assert.match(retained[0].content as string, /truncated/);
+  assert.ok(
+    Math.ceil(Buffer.byteLength(JSON.stringify(retained[0]), "utf8") / 4) <=
+      64_000,
+  );
+
+  const multipart = {
+    type: "message",
+    role: "user",
+    content: [{
+      type: "input_text",
+      text: "x".repeat(300_000),
+    }, {
+      type: "input_text",
+      text: "later text",
+    }],
+  };
+  const multipartRetained = buildReplacementHistory(
+    [multipart, { type: "compaction_trigger" }],
+    compacted,
+  );
+  assert.ok(Array.isArray(multipartRetained[0].content));
+  assert.ok((multipartRetained[0].content as any[]).every(
+    (item) => item.type !== "input_text" || typeof item.text === "string",
+  ));
+});
+
+test("replacement history does not let non-text content bypass its budget", () => {
+  const compacted = { type: "compaction", encrypted_content: "opaque" };
+  const oversizedImage = {
+    type: "message",
+    role: "user",
+    content: [{
+      type: "input_image",
+      image_url: `data:image/png;base64,${"a".repeat(300_000)}`,
+    }, {
+      type: "input_text",
+      text: "caption",
+    }],
+  };
+
+  assert.deepEqual(
+    buildReplacementHistory(
+      [oversizedImage, { type: "compaction_trigger" }],
+      compacted,
+    ),
+    [compacted],
+  );
+});
+
+test("remote compaction checkpoints parse, replay, and safely ignore stale input", () => {
+  const compacted = { type: "compaction", encrypted_content: "opaque" };
+  const parsed = parseRemoteCompactionSse([
+    `data: ${JSON.stringify({ type: "response.output_item.done", item: compacted })}`,
+    `data: ${JSON.stringify({ type: "response.completed", response: { id: "response-1" } })}`,
+  ].join("\n"));
+  assert.deepEqual(parsed, { compaction: compacted, responseId: "response-1" });
+  const checkpointInput = [
+    { role: "user", content: [{ type: "input_text", text: checkpointMarker("cp-1") }] },
+  ];
+  const details = {
+    type: "pi-codex-remote-compaction" as const,
+    version: 2 as const,
+    checkpointId: "cp-1",
+    endpoint: "https://example.test",
+    output: [compacted],
+    readFiles: [],
+    modifiedFiles: [],
+    toolCatalogFingerprint: "catalog-1",
+    contextFingerprint: fingerprintCheckpointInput(
+      checkpointInput,
+      checkpointMarker("cp-1"),
+    ),
+  };
+  assert.equal(isRemoteCompactionDetails(details), true);
+  assert.equal(
+    isRemoteCompactionDetails({ ...details, version: 1 }),
+    true,
+    "legacy Subrouter checkpoints remain readable",
+  );
+  const payload: any = { input: checkpointInput };
+  const suffix = [{ type: "message", role: "user", content: [{ type: "input_text", text: "tail" }] }];
+  const suffixPayload: any = {
+    input: [...checkpointInput, ...suffix],
+  };
+  const suffixFingerprint = fingerprintCheckpointSuffix(
+    suffixPayload.input,
+    checkpointMarker("cp-1"),
+    1,
+  );
+  assert.ok(suffixFingerprint);
+  const mismatchedSuffix: any = {
+    input: [
+      ...checkpointInput,
+      { type: "message", role: "user", content: [{ type: "input_text", text: "changed" }] },
+    ],
+  };
+  installRemoteCheckpoint(mismatchedSuffix, {
+    ...details,
+    contextFingerprint: suffixFingerprint,
+    retainedContextItemCount: 1,
+  }, {
+    toolCatalogFingerprint: "catalog-1",
+    contextFingerprint: fingerprintCheckpointSuffix(
+      mismatchedSuffix.input,
+      checkpointMarker("cp-1"),
+      1,
+    ),
+  });
+  assert.match(JSON.stringify(mismatchedSuffix), /changed/);
+  installRemoteCheckpoint(payload, details, {
+    toolCatalogFingerprint: "catalog-1",
+    contextFingerprint: fingerprintCheckpointInput(payload.input, checkpointMarker("cp-1")),
+  });
+  assert.deepEqual(payload.input, details.output);
+  const stale: any = {
+    input: [{ role: "user", content: [{ type: "input_text", text: checkpointMarker("cp-1") }] }],
+  };
+  installRemoteCheckpoint(stale, details, { toolCatalogFingerprint: "catalog-2" });
+  assert.match(JSON.stringify(stale), /cp-1/);
+  const unrelated: any = { input: [{ role: "user", content: "new request" }] };
+  installRemoteCheckpoint(unrelated, details);
+  assert.deepEqual(unrelated.input, [{ role: "user", content: "new request" }]);
+
+  const retained = buildReplacementHistory(
+    [{ role: "user", content: "first" }, { role: "assistant", content: "answer" }, { type: "function_call", role: "assistant" }, { type: "compaction_trigger" }],
+    compacted,
+  );
+  assert.deepEqual(retained.map((item) => item.content ?? item.type), ["first", "compaction"]);
 });
 
 test("official Codex binary applies add and update hunks", async () => {
