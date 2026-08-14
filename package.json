@@ -1,5 +1,5 @@
 {
-  "name": "@manaflow-ai/pi-codex",
+  "name": "@bermudi/pi-codex",
   "version": "0.1.3",
   "description": "Codex-native apply_patch, web search, remote compaction, and cmux titles for pi",
   "type": "module",

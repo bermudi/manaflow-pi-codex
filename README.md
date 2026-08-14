@@ -1,6 +1,6 @@
 # pi-codex
 
-A [pi](https://pi.dev) package from [Manaflow](https://github.com/manaflow-ai)
+A [pi](https://pi.dev) package maintained by [bermudi](https://github.com/bermudi), forked from [Manaflow](https://github.com/manaflow-ai)
 that gives Codex models OpenAI Codex's native `apply_patch` and web search tools.
 
 When the selected model uses the `openai-codex` provider, or its model ID contains `codex`, the extension replaces active `edit` and `write` tools with `apply_patch`. Switching to a non-Codex model restores the tools it removed.
