@@ -1,0 +1,52 @@
+name: Publish manaflow-pi-codex
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Must match the "Environment name" configured for the npm trusted
+    # publisher (npmjs.com/package/@bermudi/pi-codex → Trusted Publisher).
+    # The OIDC token only carries the environment claim when the job
+    # declares it; a mismatch fails publish with 404.
+    environment: npm-publish
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Verify release tag
+        if: github.event_name == 'push'
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(node -p "require('./package.json').version")"
+          test "$tag_version" = "$package_version" || {
+            echo "Tag version $tag_version does not match package version $package_version" >&2
+            exit 1
+          }
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
