@@ -812,9 +812,11 @@ test("swaps write tools only while a Codex model is selected", async () => {
       },
     },
   };
+  // Fast mode defaults to off: with no saved preference, requests carry no
+  // service_tier.
   const defaultFastPayload: any = {};
   handlers.get("before_provider_request")?.({ payload: defaultFastPayload }, fastCtx);
-  assert.equal(defaultFastPayload.service_tier, "priority");
+  assert.equal(defaultFastPayload.service_tier, undefined);
   assert.doesNotThrow(() => {
     handlers.get("after_provider_response")?.({ status: 200 }, fastCtx);
   });
@@ -825,11 +827,30 @@ test("swaps write tools only while a Codex model is selected", async () => {
   assert.equal(disabledFastPayload.service_tier, undefined);
   assert.deepEqual(fastEntries.at(-1)?.data, { enabled: false });
 
+  // A saved preference survives a new session start (restoreFastMode).
+  await handlers.get("session_start")?.({}, {
+    model: { provider: "openai-codex", id: "gpt-5.6-sol", contextWindow: 272_000 },
+    sessionManager: { getBranch: () => fastEntries },
+    hasUI: false,
+  });
+  const restoredOffPayload: any = {};
+  handlers.get("before_provider_request")?.({ payload: restoredOffPayload }, fastCtx);
+  assert.equal(restoredOffPayload.service_tier, undefined);
+
   await commands.get("fast").handler("on", fastCtx);
   const enabledFastPayload: any = {};
   handlers.get("before_provider_request")?.({ payload: enabledFastPayload }, fastCtx);
   assert.equal(enabledFastPayload.service_tier, "priority");
   assert.match(notices.at(-1) ?? "", /enabled/);
+
+  await handlers.get("session_start")?.({}, {
+    model: { provider: "openai-codex", id: "gpt-5.6-sol", contextWindow: 272_000 },
+    sessionManager: { getBranch: () => fastEntries },
+    hasUI: false,
+  });
+  const restoredOnPayload: any = {};
+  handlers.get("before_provider_request")?.({ payload: restoredOnPayload }, fastCtx);
+  assert.equal(restoredOnPayload.service_tier, "priority");
 
   const spark = {
     provider: "openai-codex",

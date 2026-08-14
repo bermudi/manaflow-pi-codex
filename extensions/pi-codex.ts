@@ -446,7 +446,7 @@ export default function piCodex(pi: ExtensionAPI) {
           entry.customType === CODEX_FAST_MODE_ENTRY &&
           typeof entry.data?.enabled === "boolean",
       );
-    fastModeEnabled = saved?.data.enabled ?? true;
+    fastModeEnabled = saved?.data.enabled ?? false;
   }
 
   function updateFastModeStatus(ctx: any) {

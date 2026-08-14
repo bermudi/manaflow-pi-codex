@@ -20,7 +20,7 @@ with `/model`. To pin this release instead of following the default
 branch:
 
 ```bash
-pi install git:github.com/bermudi/manaflow-pi-codex@v0.1.2
+pi install git:github.com/bermudi/manaflow-pi-codex@v0.1.3
 ```
 
 > The unscoped `pi-codex` package on npm is an unrelated project. Install this
@@ -85,7 +85,7 @@ The native Codex package is large because it includes the platform binary.
   tools and the `tool_result` boundary, while retaining raw search output and
   patch details for rendering and inspection. Structured non-text result
   content remains attached to the truncated model-facing result.
-- Requests Codex Fast mode (`service_tier: "priority"`) for models that advertise the Fast tier, including normal turns and remote-compaction turns.
+- Applies Codex Fast mode (`service_tier: "priority"`) when enabled for models that advertise the Fast tier, covering both normal turns and remote-compaction turns. Fast mode defaults to off (see `/fast` below).
 - Renders successful `apply_patch` results as pi-native colored diffs generated from the actual before/after files.
 - Collapses the normal compaction notice to one line; `Ctrl+O` still expands its summary.
 - Uses a static working indicator with a once-per-second elapsed-time label
@@ -149,7 +149,7 @@ Fast mode defaults to off for supported `openai-codex` models. Use:
 /fast status
 ```
 
-The selection is stored in the session, survives `/reload` and resume, and resets to on for a new session. Unsupported models and non-Codex providers ignore the tier selection.
+The selection is stored in the session, survives `/reload` and resume, and resets to off for a new session. Unsupported models and non-Codex providers ignore the tier selection.
 
 ## Development
 
