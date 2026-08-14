@@ -335,7 +335,7 @@ export default function piCodex(pi: ExtensionAPI) {
   let webSearchSelected: boolean | undefined;
   let retryTurnState: string | undefined;
   let turnState: string | undefined;
-  let fastModeEnabled = true;
+  let fastModeEnabled = false;
   let workingStartedAt: number | undefined;
   let workingTimer: ReturnType<typeof setInterval> | undefined;
   const removedForCodex = new Set<string>();

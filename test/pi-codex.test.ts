@@ -1025,7 +1025,7 @@ test("remote compaction persists and reinstalls Codex replacement history", asyn
     assert.equal(headers.get("x-codex-beta-features"), "remote_compaction_v2");
     const body = JSON.parse(String(requestedInit?.body));
     assert.equal(body.model, "gpt-5.6-sol");
-    assert.equal(body.service_tier, CODEX_FAST_SERVICE_TIER);
+    assert.equal(body.service_tier, undefined);
     assert.equal(body.stream, true);
     assert.equal(body.instructions, "You are Codex.");
     assert.equal(body.input[0].role, "user");
@@ -1053,7 +1053,7 @@ test("remote compaction persists and reinstalls Codex replacement history", asyn
       }],
     };
     handlers.get("before_provider_request")?.({ payload: providerPayload }, ctx);
-    assert.equal(providerPayload.service_tier, "priority");
+    assert.equal(providerPayload.service_tier, undefined);
     assert.deepEqual(
       providerPayload.input,
       [...compaction.details.output, providerPayload.input.at(-1)],

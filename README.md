@@ -11,7 +11,7 @@ Install [pi](https://pi.dev), then install this package directly from GitHub:
 
 ```bash
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent
-pi install git:github.com/manaflow-ai/pi-codex
+pi install git:github.com/bermudi/manaflow-pi-codex
 pi
 ```
 
@@ -20,7 +20,7 @@ with `/model`. To pin this release instead of following the default
 branch:
 
 ```bash
-pi install git:github.com/manaflow-ai/pi-codex@v0.1.1
+pi install git:github.com/bermudi/manaflow-pi-codex@v0.1.2
 ```
 
 > The unscoped `pi-codex` package on npm is an unrelated project. Install this
@@ -42,7 +42,7 @@ one run and defaults pi to the `openai-codex` provider. Install it from a
 checkout:
 
 ```bash
-git clone https://github.com/manaflow-ai/pi-codex.git
+git clone https://github.com/bermudi/manaflow-pi-codex.git
 cd pi-codex
 npm install
 npm link
@@ -59,7 +59,7 @@ pi-codex --model openai/gpt-5.3-codex
 To install only the extension into pi without the launcher:
 
 ```bash
-pi install git:github.com/manaflow-ai/pi-codex
+pi install git:github.com/bermudi/manaflow-pi-codex
 ```
 
 The native Codex package is large because it includes the platform binary.
@@ -140,7 +140,7 @@ available to the tool-search lifecycle and checkpoint fingerprint.
 
 ## Fast mode
 
-Fast mode defaults to on for supported `openai-codex` models. Use:
+Fast mode defaults to off for supported `openai-codex` models. Use:
 
 ```text
 /fast          # toggle

@@ -1,17 +1,17 @@
 {
   "name": "@manaflow-ai/pi-codex",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Codex-native apply_patch, web search, remote compaction, and cmux titles for pi",
   "type": "module",
   "license": "MIT",
   "author": "Manaflow AI",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/manaflow-ai/pi-codex.git"
+    "url": "git+https://github.com/bermudi/manaflow-pi-codex.git"
   },
-  "homepage": "https://github.com/manaflow-ai/pi-codex#readme",
+  "homepage": "https://github.com/bermudi/manaflow-pi-codex#readme",
   "bugs": {
-    "url": "https://github.com/manaflow-ai/pi-codex/issues"
+    "url": "https://github.com/bermudi/manaflow-pi-codex/issues"
   },
   "bin": {
     "pi-codex": "./bin/pi-codex.js"
