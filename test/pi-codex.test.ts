@@ -20,30 +20,13 @@ import piCodex, {
   CODEX_SOL_AUTO_COMPACT_LIMIT,
   CODEX_SOL_CONTEXT_WINDOW,
   CODEX_SOL_RESERVE_TOKENS,
-  collapseSteeringMessages,
   codexAutoCompactLimit,
-  continueAfterSteeringMessage,
   formatWorkingElapsed,
   installCompactCompactionRenderer,
   isCodexModel,
   pathsFromPatch,
   supportsCodexFastMode,
 } from "../extensions/pi-codex.ts";
-import cmuxTabTitle, {
-  buildWorkspaceInventory,
-  fallbackTabTitle,
-  isSyntheticBackgroundNotification,
-  MAX_REQUEST_TIMELINE_ITEMS,
-  MAX_SESSION_SUMMARY_CHARACTERS,
-  MAX_LATEST_REQUEST_CHARACTERS,
-  MAX_TITLE_CHARACTERS,
-  parseGeneratedTitles,
-  sanitizeTabTitle,
-  serializeForkedSession,
-  TITLE_MODEL,
-  TITLE_THINKING_LEVEL,
-  titleFromJsonEvents,
-} from "../extensions/cmux-tab-title.ts";
 import {
   CODEX_APPLY_PATCH_FLAG,
   resolveCodexExecutable,
@@ -92,322 +75,6 @@ function run(executable: string, args: string[], cwd: string, input?: string) {
   });
 }
 
-test("steering messages tell every model to continue prior work by default", () => {
-  assert.equal(
-    continueAfterSteeringMessage("Also cover the error case."),
-    [
-      "<steering-message>",
-      "Treat this as an update to the current task.",
-      "Only abandon, stop, or replace the previous work if this message explicitly requests that.",
-      "",
-      "Also cover the error case.",
-      "</steering-message>",
-    ].join("\n"),
-  );
-});
-
-test("combined steering inputs collapse into one instruction block", () => {
-  const first = continueAfterSteeringMessage("Keep the answer to two lines.");
-  const second = continueAfterSteeringMessage("Use the existing terminology.");
-  assert.equal(
-    collapseSteeringMessages(`${first}\n\n${second}`),
-    continueAfterSteeringMessage(
-      "Keep the answer to two lines.\n\nUse the existing terminology.",
-    ),
-  );
-});
-
-test("cmux tab titles are short and omit session IDs", () => {
-  assert.equal(
-    sanitizeTabTitle('Title: "Context-aware cmux tabs · pi-019fc746-9cfa"'),
-    "Context-aware cmux tabs",
-  );
-  assert.equal(
-    sanitizeTabTitle("Fix authentication · 019fc746-9cfa-4cf1-a13d-39e5fe2ac3ca"),
-    "Fix authentication",
-  );
-  assert.ok(Array.from(sanitizeTabTitle("A deliberately very long title that should be cut at a useful word boundary")).length <= MAX_TITLE_CHARACTERS);
-});
-
-test("cmux fallback titles summarize the latest prompt without refs", () => {
-  assert.equal(
-    fallbackTabTitle("Could you add contextual cmux tab naming for workspace:96?"),
-    "add contextual cmux tab naming",
-  );
-});
-
-test("cmux title subagent parses the final assistant event", () => {
-  const output = [
-    JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "First title" }] } }),
-    JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Contextual tab titles" }] } }),
-  ].join("\n");
-  assert.equal(titleFromJsonEvents(output), "Contextual tab titles");
-});
-
-test("cmux workspace inventory includes every surface in the scoped workspace", () => {
-  const callerId = "11111111-1111-4111-8111-111111111111";
-  const tree = JSON.stringify({
-    windows: [{
-      workspaces: [{
-        title: "Old workspace · pi-019fc746-9cfa",
-        panes: [
-          {
-            surfaces: [{
-              id: callerId,
-              ref: "surface:1",
-              title: "Old caller title · pi-019fc746-9cfa",
-              type: "terminal",
-              here: true,
-              active: true,
-              url: null,
-            }],
-          },
-          {
-            surfaces: [{
-              id: "22222222-2222-4222-8222-222222222222",
-              ref: "surface:2",
-              title: "Preview server · pi-019fc709-b178",
-              type: "browser",
-              here: false,
-              active: false,
-              url: "https://example.com/dashboard?secret=nope",
-            }],
-          },
-        ],
-      }],
-    }],
-  });
-  const inventory = buildWorkspaceInventory(tree, callerId, "Context-aware titles");
-  assert.deepEqual(inventory, {
-    currentTitle: "Old workspace",
-    surfaces: [
-      {
-        title: "Context-aware titles",
-        type: "terminal",
-        caller: true,
-        active: true,
-      },
-      {
-        title: "Preview server",
-        type: "browser",
-        url: "https://example.com/dashboard",
-        caller: false,
-        active: false,
-      },
-    ],
-  });
-  assert.doesNotMatch(JSON.stringify(inventory), /019fc|11111111|22222222/);
-});
-
-test("cmux workspace inventory rejects a stale workspace target", () => {
-  const tree = JSON.stringify({
-    windows: [{
-      workspaces: [{
-        id: "current-workspace",
-        ref: "workspace:1",
-        title: "Different workspace",
-        panes: [],
-      }],
-    }],
-  });
-  assert.equal(
-    buildWorkspaceInventory(
-      tree,
-      "caller-surface",
-      "Fallback title",
-      "stale-workspace",
-    ),
-    undefined,
-  );
-});
-
-test("cmux naming subagent returns separate tab and workspace titles", () => {
-  assert.deepEqual(
-    parseGeneratedTitles(
-      '```json\n{"tab":"Workspace-aware naming · pi-019fc746-9cfa","workspace":"Pi Extension UX","session":"Improve contextual naming and request visibility","requests":["Build latest-request widget","Add contextual tab names","Share compact request timeline"],"latest":"Share a compact request timeline … preserve my wording"}\n```',
-      "Fallback title",
-    ),
-    {
-      tab: "Workspace-aware naming",
-      workspace: "Pi Extension UX",
-      session: "Improve contextual naming and request visibility",
-      requests: [
-        "Build latest-request widget",
-        "Add contextual tab names",
-        "Share compact request timeline",
-      ],
-      latest: "Share a compact request timeline … preserve my wording",
-    },
-  );
-  assert.equal(MAX_REQUEST_TIMELINE_ITEMS, 3);
-  assert.equal(MAX_SESSION_SUMMARY_CHARACTERS, 80);
-  assert.equal(MAX_LATEST_REQUEST_CHARACTERS, 240);
-});
-
-test("cmux naming always uses Codex 5.6 Luna at medium effort", () => {
-  assert.equal(TITLE_MODEL, "openai-codex/gpt-5.6-luna");
-  assert.equal(TITLE_THINKING_LEVEL, "medium");
-});
-
-test("cmux naming ignores synthetic background notification turns", () => {
-  assert.equal(
-    isSyntheticBackgroundNotification(`
-      <background-job-notification>
-        <job-id>abc123</job-id>
-        <status>completed</status>
-      </background-job-notification>
-    `),
-    true,
-  );
-  assert.equal(
-    isSyntheticBackgroundNotification(`
-      <background-monitor-notification>
-        <monitor-id>monitor-1</monitor-id>
-        <matches>CI passed</matches>
-      </background-monitor-notification>
-    `),
-    true,
-  );
-  assert.equal(
-    isSyntheticBackgroundNotification(`
-      <cron-notification source="pi-cron" automated="true">
-        <job-id>cron-1</job-id>
-      </cron-notification>
-    `),
-    true,
-  );
-  assert.equal(
-    isSyntheticBackgroundNotification(`
-      <background-job-notification>
-        <job-id>abc123</job-id>
-      </background-job-notification>
-      Please summarize what happened.
-    `),
-    false,
-  );
-  assert.equal(isSyntheticBackgroundNotification("Work on background jobs"), false);
-});
-
-test("cmux naming starts its cmux processes only after the message handler returns", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-cmux-background-test-"));
-  const cmuxLog = join(directory, "cmux.log");
-  const fakeCmux = join(directory, "cmux");
-  const fakePi = join(directory, "pi");
-  const environmentKeys = [
-    "CMUX_PI_CMUX_BIN",
-    "CMUX_SOCKET_PATH",
-    "CMUX_SURFACE_ID",
-    "CMUX_WORKSPACE_ID",
-    "PI_CMUX_TAB_TITLE_PI_BIN",
-    "PI_CMUX_TAB_TITLE_SUBAGENT",
-    "CMUX_TEST_LOG",
-  ] as const;
-  const previousEnvironment = Object.fromEntries(
-    environmentKeys.map((key) => [key, process.env[key]]),
-  );
-
-  try {
-    await writeFile(
-      fakeCmux,
-      [
-        "#!/bin/sh",
-        'printf "%s\\n" "$*" >> "$CMUX_TEST_LOG"',
-        'case " $* " in',
-        '  *" --json tree "*) printf \'%s\\n\' \'{"windows":[]}\' ;;',
-        "esac",
-      ].join("\n"),
-      { mode: 0o755 },
-    );
-    await writeFile(
-      fakePi,
-      [
-        "#!/bin/sh",
-        "printf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"{\\\"tab\\\":\\\"Background cmux naming\\\",\\\"workspace\\\":\\\"\\\"}\"}]}}'",
-      ].join("\n"),
-      { mode: 0o755 },
-    );
-
-    process.env.CMUX_PI_CMUX_BIN = fakeCmux;
-    process.env.CMUX_SOCKET_PATH = join(directory, "cmux.sock");
-    process.env.CMUX_SURFACE_ID = "test-surface";
-    process.env.CMUX_WORKSPACE_ID = "test-workspace";
-    process.env.PI_CMUX_TAB_TITLE_PI_BIN = fakePi;
-    process.env.CMUX_TEST_LOG = cmuxLog;
-    delete process.env.PI_CMUX_TAB_TITLE_SUBAGENT;
-
-    let beforeAgentStart:
-      | ((event: { prompt: string }, ctx: Record<string, unknown>) => unknown)
-      | undefined;
-    let sessionShutdown: (() => unknown) | undefined;
-    cmuxTabTitle({
-      on(event: string, handler: (...args: any[]) => unknown) {
-        if (event === "before_agent_start") beforeAgentStart = handler;
-        if (event === "session_shutdown") sessionShutdown = handler;
-      },
-    } as never);
-
-    assert.ok(beforeAgentStart);
-    const context = {
-      mode: "tui",
-      cwd: directory,
-      sessionManager: {
-        getSessionFile: () => join(directory, "source.jsonl"),
-        getBranch: () => [],
-      },
-    };
-    const notificationResult = beforeAgentStart(
-      {
-        prompt:
-          "<background-job-notification><job-id>done</job-id></background-job-notification>",
-      },
-      context,
-    );
-    assert.equal(notificationResult, undefined);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(existsSync(cmuxLog), false);
-
-    const result = beforeAgentStart(
-      { prompt: "Keep cmux work in the background" },
-      context,
-    );
-    assert.equal(result, undefined);
-    assert.equal(existsSync(cmuxLog), false);
-
-    const deadline = Date.now() + 2_000;
-    while (!existsSync(cmuxLog) && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    assert.match(await readFile(cmuxLog, "utf8"), /rename-tab/);
-    sessionShutdown?.();
-  } finally {
-    for (const key of environmentKeys) {
-      const value = previousEnvironment[key];
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("cmux title snapshots contain every entry on the active branch", () => {
-  const branch = [
-    { type: "message", id: "one", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", message: { role: "user", content: [{ type: "text", text: "first" }], timestamp: 1 } },
-    { type: "message", id: "two", parentId: "one", timestamp: "2026-01-01T00:00:01.000Z", message: { role: "assistant", content: [{ type: "text", text: "second" }], timestamp: 2 } },
-    { type: "message", id: "three", parentId: "two", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "user", content: [{ type: "text", text: "third" }], timestamp: 3 } },
-  ];
-  const snapshot = serializeForkedSession({
-    cwd: "/tmp/project",
-    sessionManager: {
-      getSessionFile: () => "/tmp/source.jsonl",
-      getBranch: () => branch as never,
-    },
-  });
-  const entries = snapshot.trimEnd().split("\n").map((line) => JSON.parse(line));
-  assert.equal(entries[0].type, "session");
-  assert.equal(entries[0].parentSession, "/tmp/source.jsonl");
-  assert.deepEqual(entries.slice(1), branch);
-});
-
 test("uses the upstream freeform apply_patch grammar", () => {
   assert.match(applyPatchGrammar, /^start: begin_patch hunk\+ end_patch/m);
   assert.match(applyPatchGrammar, /update_hunk:.*change_move\? change\?/);
@@ -452,6 +119,14 @@ test("recognizes Codex models", () => {
     true,
   );
   assert.equal(isCodexModel({ provider: "openai", id: "gpt-5.4" } as never), false);
+  assert.equal(
+    isCodexModel({ provider: "openrouter", id: "deepseek/deepseek-v4-flash-free" } as never),
+    true,
+  );
+  assert.equal(isCodexModel({ provider: "openrouter", id: "deepseek-v4-pro" } as never), true);
+  assert.equal(isCodexModel({ provider: "openrouter", id: "deepseek-v4" } as never), true);
+  assert.equal(isCodexModel({ provider: "openrouter", id: "deepseek-v4.5" } as never), false);
+  assert.equal(isCodexModel({ provider: "openrouter", id: "deepseek-v3-r1" } as never), false);
   assert.equal(
     supportsCodexFastMode({ provider: "openai-codex", id: "gpt-5.6-sol" } as never),
     true,
@@ -798,7 +473,7 @@ test("swaps write tools only while a Codex model is selected", async () => {
       },
     },
   });
-  assert.deepEqual(workingIndicator, { frames: ["●"] });
+  assert.equal(workingIndicator, undefined);
   const notices: string[] = [];
   const fastCtx = {
     model: { provider: "openai-codex", id: "gpt-5.6-sol", contextWindow: 272_000 },

@@ -80,7 +80,6 @@ const CODEX_FAST_MODE_MODELS = new Set([
 ]);
 const CODEX_FAST_MODE_ENTRY = "pi-codex-fast-mode";
 const CODEX_FAST_MODE_STATUS = "pi-codex-fast-mode";
-const STATIC_WORKING_INDICATOR = "●";
 const compactionPatchMarker: unique symbol = Symbol.for(
   "pi-codex.provider-compaction-threshold.v1",
 ) as any;
@@ -268,9 +267,12 @@ type ApplyPatchDetails = {
 function isCodexModel(model: Model<any> | undefined): boolean {
   // Tool selection follows the wire protocol first. A subrouter alias may
   // expose the Codex Responses API without containing "codex" in its name.
+  // DeepSeek-v4 models are trained on the Codex harness and emit native
+  // apply_patch output.
   const modelId = model?.id ?? "";
   return isOpenAICodexModel(model) ||
-    /(?:^|[-_.])codex(?:$|[-_.])/.test(modelId);
+    /(?:^|[-_.])codex(?:$|[-_.])/.test(modelId) ||
+    /(?:^|[-_./])deepseek-v4(?:-|$)/.test(modelId);
 }
 
 function changedPathsFromOutput(output: string): string[] {
@@ -289,35 +291,6 @@ function pathsFromPatch(patch: string): string[] {
     if (movePath) paths.add(movePath);
   }
   return [...paths];
-}
-
-function continueAfterSteeringMessage(text: string): string {
-  return [
-    "<steering-message>",
-    "Treat this as an update to the current task.",
-    "Only abandon, stop, or replace the previous work if this message explicitly requests that.",
-    "",
-    text,
-    "</steering-message>",
-  ].join("\n");
-}
-
-function collapseSteeringMessages(text: string): string {
-  const blocks = [
-    ...text.matchAll(
-      /<steering-message>\nTreat this as an update to the current task\.\nOnly abandon, stop, or replace the previous work if this message explicitly requests that\.\n\n([\s\S]*?)\n<\/steering-message>/g,
-    ),
-  ];
-  if (blocks.length < 2) return text;
-
-  let remainder = text;
-  for (const block of blocks) remainder = remainder.replace(block[0], "");
-  remainder = remainder.trim();
-  if (remainder) return text;
-
-  return continueAfterSteeringMessage(
-    blocks.map((block) => block[1]).join("\n\n"),
-  );
 }
 
 async function readPatchFile(cwd: string, path: string): Promise<string> {
@@ -456,18 +429,6 @@ export default function piCodex(pi: ExtensionAPI) {
       CODEX_FAST_MODE_STATUS,
       visible ? ctx.ui.theme.fg("accent", "fast") : undefined,
     );
-  }
-
-  function installSelectionFriendlyWorkingIndicator(ctx: any) {
-    if (!ctx.hasUI) return;
-    // Pi's default 80ms spinner writes to the terminal even when no streamed
-    // content changed. Terminal writes clear an in-progress text selection, so
-    // keep the same working row and status message with a static indicator.
-    // This uses the public per-session UI API rather than disabling or patching
-    // any other extension.
-    ctx.ui.setWorkingIndicator({
-      frames: [ctx.ui.theme.fg("accent", STATIC_WORKING_INDICATOR)],
-    });
   }
 
   function startWorkingTicker(ctx: any) {
@@ -769,42 +730,6 @@ export default function piCodex(pi: ExtensionAPI) {
     };
   });
 
-  // Steering is model-independent. Make an interruption additive by default
-  // while preserving the user's ability to explicitly stop or replace the task.
-  pi.on("input", (event) => {
-    if (event.streamingBehavior !== "steer") return;
-    return {
-      action: "transform",
-      text: continueAfterSteeringMessage(event.text),
-    };
-  });
-
-  // In "all" delivery mode, pi may combine several queued steering inputs into
-  // one user message. Remove the repeated instructions before model requests.
-  pi.on("context", (event) => {
-    let changed = false;
-    const messages = event.messages.map((message) => {
-      if (message.role !== "user") return message;
-      if (typeof message.content === "string") {
-        const content = collapseSteeringMessages(message.content);
-        if (content === message.content) return message;
-        changed = true;
-        return { ...message, content };
-      }
-      let messageChanged = false;
-      const content = message.content.map((item) => {
-        if (item.type !== "text") return item;
-        const text = collapseSteeringMessages(item.text);
-        if (text === item.text) return item;
-        changed = true;
-        messageChanged = true;
-        return { ...item, text };
-      });
-      return messageChanged ? { ...message, content } : message;
-    });
-    if (changed) return { messages };
-  });
-
   pi.on("session_before_compact", async (event, ctx) => {
     const model = ctx.model;
     if (!supportsCodexRemoteCompaction(model)) return;
@@ -975,7 +900,6 @@ export default function piCodex(pi: ExtensionAPI) {
     restoreFastMode(ctx);
     syncTools(ctx.model);
     updateFastModeStatus(ctx);
-    installSelectionFriendlyWorkingIndicator(ctx);
   });
   pi.on("model_select", (event, ctx) => {
     syncTools(event.model);
@@ -994,10 +918,8 @@ export {
   CODEX_SOL_AUTO_COMPACT_LIMIT,
   CODEX_SOL_CONTEXT_WINDOW,
   CODEX_SOL_RESERVE_TOKENS,
-  collapseSteeringMessages,
   codexAutoCompactLimit,
   codexCompactionReserve,
-  continueAfterSteeringMessage,
   formatWorkingElapsed,
   installCompactCompactionRenderer,
   isCodexModel,
