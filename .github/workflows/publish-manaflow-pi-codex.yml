@@ -59,6 +59,9 @@ jobs:
 
       - name: Publish to npm
         run: |
+          echo "NODE_AUTH_TOKEN type: $(echo "$NODE_AUTH_TOKEN" | awk -F. '{print NF}') segments, len=$(echo -n "$NODE_AUTH_TOKEN" | wc -c)"
+          echo "npm whoami: $(npm whoami 2>&1)"
+          npm access ls-collaborators @bermudi/pi-codex 2>&1 || true
           export NPM_CONFIG_LOGLEVEL=verbose
           npm publish --provenance --access public || {
             echo "===== NPM DEBUG LOG ====="
