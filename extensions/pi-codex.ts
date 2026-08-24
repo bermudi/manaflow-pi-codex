@@ -5,6 +5,8 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum, type Model } from "@earendil-works/pi-ai";
 import {
+  CompactionSummaryMessageComponent,
+  generateDiffString,
   renderDiff,
   SettingsManager,
   type ToolDefinition,
@@ -56,14 +58,11 @@ import {
 const grammarPath = fileURLToPath(new URL("../src/apply-patch.lark", import.meta.url));
 const applyPatchGrammar = readFileSync(grammarPath, "utf8");
 const replacedTools = ["edit", "write"] as const;
-const codingAgentEntryUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
-const compactionComponentUrl = new URL(
-  "./modes/interactive/components/compaction-summary-message.js",
-  codingAgentEntryUrl,
-).href;
-const { CompactionSummaryMessageComponent } = await import(compactionComponentUrl);
-const editDiffUrl = new URL("./core/tools/edit-diff.js", codingAgentEntryUrl).href;
-const { generateDiffString } = await import(editDiffUrl);
+// CompactionSummaryMessageComponent and generateDiffString are public root
+// exports of @earendil-works/pi-coding-agent. Never reach into pi's dist
+// tree by file URL: the bundled pi distribution does not ship those files on
+// disk, and `import.meta.resolve` bypasses the extension sandbox module map,
+// which is what broke npm-installed 0.1.5.
 const compactRendererMarker: unique symbol = Symbol.for(
   "pi-codex.compact-compaction-renderer.v1",
 ) as any;
@@ -96,7 +95,7 @@ type PatchableCompactionComponent = {
 
 function installCompactCompactionRenderer() {
   const prototype =
-    CompactionSummaryMessageComponent.prototype as PatchableCompactionComponent;
+    CompactionSummaryMessageComponent.prototype as unknown as PatchableCompactionComponent;
   if (prototype[compactRendererMarker]) return;
 
   const original = prototype.updateDisplay;
