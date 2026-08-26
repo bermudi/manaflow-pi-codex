@@ -75,6 +75,25 @@ function run(executable: string, args: string[], cwd: string, input?: string) {
   });
 }
 
+function renderTheme() {
+  return {
+    bold: (text: string) => text,
+    fg: (_name: string, text: string) => text,
+    bg: (_name: string, text: string) => text,
+  };
+}
+
+function renderCtx(toolCallId: string, expanded = false) {
+  return {
+    toolCallId,
+    expanded,
+    isPartial: false,
+    isError: false,
+    argsComplete: true,
+    invalidate: () => {},
+  } as any;
+}
+
 test("uses the upstream freeform apply_patch grammar", () => {
   assert.match(applyPatchGrammar, /^start: begin_patch hunk\+ end_patch/m);
   assert.match(applyPatchGrammar, /update_hunk:.*change_move\? change\?/);
@@ -186,10 +205,7 @@ test("standalone web search executes through the subrouter and renders as a Pi t
   assert.ok(webSearch);
   const renderedCall = webSearch.renderCall(
     { search_query: [{ q: "OpenAI Codex" }] },
-    {
-      bold: (text: string) => text,
-      fg: (_name: string, text: string) => text,
-    },
+    renderTheme(),
   );
   assert.match(renderedCall.render(120).join("\n"), /web_search OpenAI Codex/);
 
@@ -255,14 +271,30 @@ test("standalone web search executes through the subrouter and renders as a Pi t
     assert.deepEqual(body.commands.search_query, [{ q: "OpenAI Codex" }]);
     assert.equal(result.details.endpoint, requestedUrl);
 
-    const renderedResult = webSearch.renderResult(
+    // Burst rendering: the collapsed call hides the output; after renderResult
+    // records the result, an expanded renderCall shows the raw output.
+    const rowCtx = renderCtx("search-1");
+    const collapsed = webSearch.renderCall(
+      { search_query: [{ q: "OpenAI Codex" }], response_length: "short" },
+      renderTheme(),
+      rowCtx,
+    );
+    webSearch.renderResult(
       result,
-      { expanded: false },
-      { fg: (_name: string, text: string) => text },
-      { isError: false },
+      { expanded: false, isPartial: false },
+      renderTheme(),
+      rowCtx,
+    );
+    const collapsedText = stripVTControlCharacters(collapsed.render(120).join("\n"));
+    assert.doesNotMatch(collapsedText, /Search result with source/);
+    rowCtx.expanded = true;
+    const expanded = webSearch.renderCall(
+      { search_query: [{ q: "OpenAI Codex" }], response_length: "short" },
+      renderTheme(),
+      rowCtx,
     );
     assert.match(
-      renderedResult.render(120).join("\n"),
+      stripVTControlCharacters(expanded.render(120).join("\n")),
       /Search result with source https:\/\/example\.com/,
     );
 
@@ -364,11 +396,24 @@ test("apply_patch captures display-oriented diffs from actual file changes", asy
     assert.match(result.details.diffs[0].diff, /-1 hello/);
     assert.match(result.details.diffs[0].diff, /\+1 hello colored diff/);
     initTheme(undefined, false);
-    const rendered = tool.renderResult(
-      result,
-      { expanded: false, isPartial: false },
-      { fg: (_name: string, text: string) => text },
-      { isError: false },
+    // Burst rendering: collapsed header shows the touched paths only; the
+    // diff appears once the row is expanded.
+    const theme = renderTheme();
+    const rowCtx = renderCtx("call-1");
+    const collapsed = tool.renderCall(
+      { patch: "*** Begin Patch\n*** Update File: hello.txt\n@@\n-hello\n+hello colored diff\n*** End Patch" },
+      theme,
+      rowCtx,
+    );
+    tool.renderResult(result, { expanded: false, isPartial: false }, theme, rowCtx);
+    const collapsedText = stripVTControlCharacters(collapsed.render(120).join("\n"));
+    assert.match(collapsedText, /apply_patch hello\.txt/);
+    assert.doesNotMatch(collapsedText, /hello colored diff/);
+    rowCtx.expanded = true;
+    const rendered = tool.renderCall(
+      { patch: "*** Begin Patch\n*** Update File: hello.txt\n@@\n-hello\n+hello colored diff\n*** End Patch" },
+      theme,
+      rowCtx,
     );
     const renderedText = rendered.render(120).join("\n");
     assert.match(stripVTControlCharacters(renderedText), /hello colored diff/);

@@ -46,6 +46,14 @@ import {
   type WebSearchDetails,
 } from "../src/web-search.ts";
 import {
+  burstBox,
+  burstBullet,
+  burstDetailBlock,
+  BurstTracker,
+  emptyBurstRow,
+  type BurstTheme,
+} from "../src/clean-burst.ts";
+import {
   ToolContractRegistry,
   fingerprintToolSpecs,
 } from "../src/tool-contract.ts";
@@ -292,6 +300,25 @@ function pathsFromPatch(patch: string): string[] {
   return [...paths];
 }
 
+// ── Clean burst rendering (mirrors bermudis-pi-goodies clean-tui.ts) ──
+const burstTracker = new BurstTracker();
+
+function applyPatchLabel(patch: string): string {
+  return pathsFromPatch(patch).join(", ") || "patch";
+}
+
+function applyPatchBullet(entry: any, theme: BurstTheme): string {
+  return burstBullet(theme, applyPatchLabel(entry.args?.patch ?? ""), entry.isError);
+}
+
+function webSearchLabel(commands: unknown): string {
+  return summarizeWebSearchCommands(commands as WebSearchCommands);
+}
+
+function webSearchBullet(entry: any, theme: BurstTheme): string {
+  return burstBullet(theme, webSearchLabel(entry.args ?? {}), entry.isError);
+}
+
 async function readPatchFile(cwd: string, path: string): Promise<string> {
   try {
     return await readFile(resolve(cwd, path), "utf8");
@@ -303,6 +330,7 @@ async function readPatchFile(cwd: string, path: string): Promise<string> {
 export default function piCodex(pi: ExtensionAPI) {
   installCodexCompactionThreshold();
   installCompactCompactionRenderer();
+  burstTracker.registerHandlers(pi);
   let applyPatchSelected: boolean | undefined;
   let webSearchSelected: boolean | undefined;
   let retryTurnState: string | undefined;
@@ -531,25 +559,51 @@ export default function piCodex(pi: ExtensionAPI) {
         } satisfies WebSearchDetails,
       };
     },
-    renderCall(commands, theme) {
-      const summary = summarizeWebSearchCommands(commands as WebSearchCommands);
-      return new Text(
-        `${theme.fg("toolTitle", theme.bold("web_search"))} ${theme.fg("muted", summary)}`,
-        0,
-        0,
+    renderShell: "self",
+    renderCall(commands, theme, context) {
+      const ctx = context as any;
+      const view = burstTracker.view(
+        ctx?.toolCallId,
+        "web_search",
+        commands,
+        ctx?.invalidate,
       );
+      if (!view) return emptyBurstRow();
+      const { burst } = view;
+      const pending = burst.some((e) => !e.result);
+      const isError = burst.some((e) => e.isError);
+      const title = theme.fg("toolTitle", theme.bold("web_search"));
+      let header: string;
+      if (burst.length > 1) {
+        header = `${title} ${theme.fg("muted", `×${burst.length}`)}`;
+        header += `\n${burst.map((e) => webSearchBullet(e, theme)).join("\n")}`;
+      } else {
+        header = `${title} ${theme.fg("muted", webSearchLabel(commands))}`;
+      }
+      if (ctx?.expanded) {
+        const blocks: string[] = [];
+        for (const e of burst) {
+          const label = webSearchLabel(e.args ?? {});
+          const raw = (e.result?.details as WebSearchDetails | undefined)?.rawOutput;
+          if (!raw) {
+            if (burst.length > 1)
+              blocks.push(theme.fg("warning", `— ${label}: pending`));
+            continue;
+          }
+          blocks.push(burstDetailBlock(theme, label, raw));
+        }
+        if (blocks.length) header += `\n${blocks.join("\n")}`;
+      }
+      return burstBox(theme, pending, isError, header);
     },
-    renderResult(result, { expanded }, theme, { isError }) {
-      const rawOutput = (result.details as WebSearchDetails | undefined)?.rawOutput;
-      const output =
-        expanded && rawOutput
-          ? rawOutput
-          : result.content
-              .map((item) => (item.type === "text" ? item.text : ""))
-              .join("\n");
-      const visible =
-        expanded || output.length <= 2_000 ? output : `${output.slice(0, 2_000).trimEnd()}\n…`;
-      return new Text(theme.fg(isError ? "error" : "toolOutput", visible), 0, 0);
+    renderResult(result, _options, _theme, context) {
+      const ctx = context as any;
+      burstTracker.recordResult(
+        ctx?.toolCallId,
+        result,
+        !!ctx?.isError || !!(result as any)?.isError,
+      );
+      return emptyBurstRow();
     },
   };
   const webSearchContract = toolContracts.register(webSearchDefinition, {
@@ -579,6 +633,7 @@ export default function piCodex(pi: ExtensionAPI) {
       variants: { openai_lark: applyPatchGrammar },
     },
     executionMode: "sequential",
+    renderShell: "self",
 
     async execute(_toolCallId, { patch }, signal, _onUpdate, ctx) {
       const patchPaths = pathsFromPatch(patch);
@@ -631,32 +686,58 @@ export default function piCodex(pi: ExtensionAPI) {
       };
     },
 
-    renderCall({ patch }, theme) {
-      const paths = patch
-        .split("\n")
-        .map((line) => line.match(/^\*\*\* (?:Add|Delete|Update) File: (.+)$/)?.[1])
-        .filter((path): path is string => path !== undefined);
-      const summary = paths.length > 0 ? paths.join(", ") : "patch";
-      return new Text(
-        `${theme.fg("toolTitle", theme.bold("apply_patch"))} ${theme.fg("muted", summary)}`,
-        0,
-        0,
+    renderCall(args, theme, context) {
+      const ctx = context as any;
+      const patch = (args as { patch: string }).patch;
+      const view = burstTracker.view(
+        ctx?.toolCallId,
+        "apply_patch",
+        args,
+        ctx?.invalidate,
       );
+      if (!view) return emptyBurstRow();
+      const { burst } = view;
+      const pending = burst.some((e) => !e.result);
+      const isError = burst.some((e) => e.isError);
+      const title = theme.fg("toolTitle", theme.bold("apply_patch"));
+      let header: string;
+      if (burst.length > 1) {
+        header = `${title} ${theme.fg("muted", `×${burst.length}`)}`;
+        header += `\n${burst.map((e) => applyPatchBullet(e, theme)).join("\n")}`;
+      } else {
+        header = `${title} ${theme.fg("accent", applyPatchLabel(patch))}`;
+      }
+      if (ctx?.expanded) {
+        const blocks: string[] = [];
+        for (const e of burst) {
+          const label = applyPatchLabel(e.args?.patch ?? "");
+          const diffs = (e.result?.details as ApplyPatchDetails | undefined)?.diffs ?? [];
+          if (!diffs.length) {
+            if (burst.length > 1)
+              blocks.push(theme.fg("warning", `— ${label}: pending`));
+            continue;
+          }
+          const body = diffs
+            .map(
+              ({ path, diff }) =>
+                `${theme.fg("muted", path)}\n${renderDiff(diff, { filePath: path })}`,
+            )
+            .join("\n\n");
+          blocks.push(`\n${theme.fg("muted", `— ${label}`)}:\n${body}`);
+        }
+        if (blocks.length) header += `\n${blocks.join("\n")}`;
+      }
+      return burstBox(theme, pending, isError, header);
     },
 
-    renderResult(result, _options, theme, { isError }) {
-      const details = result.details as ApplyPatchDetails | undefined;
-      const renderedDiffs = details?.diffs
-        .map(
-          ({ path, diff }) =>
-            `${theme.fg("muted", path)}\n${renderDiff(diff, { filePath: path })}`,
-        )
-        .join("\n\n");
-      if (renderedDiffs) return new Text(renderedDiffs, 0, 0);
-      const text = details?.changedPaths.length
-        ? `Updated ${details.changedPaths.join(", ")}`
-        : result.content.map((item) => (item.type === "text" ? item.text : "")).join("\n");
-      return new Text(theme.fg(isError ? "error" : "success", text), 0, 0);
+    renderResult(result, _options, _theme, context) {
+      const ctx = context as any;
+      burstTracker.recordResult(
+        ctx?.toolCallId,
+        result,
+        !!ctx?.isError || !!(result as any)?.isError,
+      );
+      return emptyBurstRow();
     },
   };
   const applyPatchContract = toolContracts.register(applyPatchDefinition, {
