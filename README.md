@@ -75,7 +75,7 @@ The native Codex package is large because it includes the platform binary.
 - Executes patches sequentially relative to other tool calls.
 - Respects tool selection: if `apply_patch` was excluded initially, `edit` and `write` are not replaced.
 - Falls back to pi's normal `edit` and `write` tools after switching away from a Codex model.
-- Enables Codex's standalone live `web_search` tool for the `openai-codex` provider and renders its calls as clean burst rows (same-tool calls within one assistant message share one block; output stays hidden until the row is expanded).
+- Enables Codex's standalone live `web_search` tool for the `openai-codex` provider. Rendering adapts: standalone (or with goodies' clean-tui disabled) it renders like pi's native tool rows with the search output visible; with bermudis-pi-goodies' clean-tui enabled it renders as a clean burst row (same-tool calls share one block; output hidden until the row is expanded).
 - Sends standalone search to the resolved Codex `/alpha/search` endpoint, preserving provider base URL and header overrides.
 - Uses current Codex remote compaction V2 for the `openai-codex` provider.
 - Applies Codex's model-facing middle-output truncation policy to package
@@ -83,7 +83,7 @@ The native Codex package is large because it includes the platform binary.
   patch details for rendering and inspection. Structured non-text result
   content remains attached to the truncated model-facing result.
 - Applies Codex Fast mode (`service_tier: "priority"`) when enabled for models that advertise the Fast tier, covering both normal turns and remote-compaction turns. Fast mode defaults to off (see `/fast` below).
-- Renders `apply_patch` as a clean burst row: the collapsed header shows the touched paths, and `Ctrl+O` expands to pi-native colored diffs generated from the actual before/after files.
+- Renders `apply_patch` like pi's native edit row (colored diffs visible) by default; with bermudis-pi-goodies' clean-tui enabled it renders as a clean burst row — collapsed header shows the touched paths, `Ctrl+O` expands to pi-native colored diffs generated from the actual before/after files.
 - Collapses the normal compaction notice to one line; `Ctrl+O` still expands its summary.
 - Keeps Pi's normal working spinner and adds a once-per-second elapsed-time
   label (`Working (12s)`, `Working (1m 5s)`) to the working row.

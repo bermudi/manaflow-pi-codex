@@ -16,6 +16,23 @@
  */
 import { Box, Container, Text } from "@earendil-works/pi-tui";
 
+/**
+ * Process-global flag contract with bermudis-pi-goodies/clean-tui: while the
+ * flag is set, codex tools render in burst style; without it they render in
+ * their standalone edit-like style. clean-tui sets the flag when it loads and
+ * clears it when the feature is disabled, so /reload converges. Rendering
+ * only happens after both extensions load, so the flag is always settled
+ * before the first renderCall. Key is versioned — bump on any contract
+ * change; the same key literal lives in goodies' clean-tui.ts.
+ */
+export const CLEAN_TUI_ACTIVE = Symbol.for(
+  "bermudis-pi-goodies.clean-tui.active.v1",
+);
+
+export function isCleanTuiActive(): boolean {
+  return (globalThis as Record<symbol, unknown>)[CLEAN_TUI_ACTIVE] === true;
+}
+
 export type BurstEntry = {
   toolCallId: string;
   toolName: string;
@@ -125,22 +142,13 @@ export class BurstTracker {
    * the whole block). A missing toolCallId (definition-level rendering, tests)
    * renders an untracked solo view.
    */
-  view(
-    toolCallId: string | undefined,
+  /** Create or update an entry and remember its invalidation hook. */
+  private upsert(
+    toolCallId: string,
     toolName: string,
     args: any,
     invalidate?: () => void,
-  ): { entry: BurstEntry; burst: BurstEntry[] } | null {
-    if (!toolCallId) {
-      const pseudo: BurstEntry = {
-        toolCallId: "",
-        toolName,
-        args,
-        seg: NaN,
-        index: -1,
-      };
-      return { entry: pseudo, burst: [pseudo] };
-    }
+  ): BurstEntry {
     let entry = this.byId.get(toolCallId);
     if (!entry) {
       entry = {
@@ -158,6 +166,49 @@ export class BurstTracker {
       entry.args = args;
     }
     if (invalidate) this.invalidates.set(toolCallId, invalidate);
+    return entry;
+  }
+
+  /**
+   * Call from renderCall in default (non-clean-tui) rendering: per-entry
+   * box state without burst semantics — every row renders itself, nothing
+   * groups, so a follower render must not hide it or refresh a leader.
+   * Upserts so recordResult keeps the box color fresh.
+   */
+  solo(
+    toolCallId: string | undefined,
+    toolName: string,
+    args: any,
+    invalidate?: () => void,
+  ): { pending: boolean; isError: boolean } {
+    if (!toolCallId) return { pending: true, isError: false };
+    const entry = this.upsert(toolCallId, toolName, args, invalidate);
+    return { pending: !entry.result, isError: !!entry.isError };
+  }
+
+  /**
+   * Call from renderCall in burst (clean-tui) rendering. Returns the entry's
+   * burst view; the caller renders an empty Container when the entry is a
+   * burst follower (the leader carries the whole block). A missing toolCallId
+   * (definition-level rendering, tests) renders an untracked solo view.
+   */
+  view(
+    toolCallId: string | undefined,
+    toolName: string,
+    args: any,
+    invalidate?: () => void,
+  ): { entry: BurstEntry; burst: BurstEntry[] } | null {
+    if (!toolCallId) {
+      const pseudo: BurstEntry = {
+        toolCallId: "",
+        toolName,
+        args,
+        seg: NaN,
+        index: -1,
+      };
+      return { entry: pseudo, burst: [pseudo] };
+    }
+    const entry = this.upsert(toolCallId, toolName, args, invalidate);
 
     const idx = entry.index;
     let start = idx;

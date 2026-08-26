@@ -12,7 +12,7 @@ import {
   type ToolDefinition,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type Box } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   CODEX_APPLY_PATCH_FLAG,
@@ -51,6 +51,7 @@ import {
   burstDetailBlock,
   BurstTracker,
   emptyBurstRow,
+  isCleanTuiActive,
   type BurstTheme,
 } from "../src/clean-burst.ts";
 import {
@@ -319,6 +320,88 @@ function webSearchBullet(entry: any, theme: BurstTheme): string {
   return burstBullet(theme, webSearchLabel(entry.args ?? {}), entry.isError);
 }
 
+// ── Default (standalone) rendering — used when clean-tui is not active ──
+// Mirrors pi's native edit rows: the call shows the title and touched paths,
+// and the result (colored diff / search output) stays visible. State comes
+// from the same tracker so box colors update when results land.
+
+function applyPatchDefaultRenderCall(
+  args: { patch: string },
+  theme: BurstTheme,
+  context: any,
+): Box {
+  const { pending, isError } = burstTracker.solo(
+    context?.toolCallId,
+    "apply_patch",
+    args,
+    context?.invalidate,
+  );
+  const header = `${theme.fg("toolTitle", theme.bold("apply_patch"))} ${theme.fg("accent", applyPatchLabel(args?.patch ?? ""))}`;
+  return burstBox(theme, pending, isError, header);
+}
+
+function applyPatchDefaultRenderResult(
+  result: any,
+  theme: BurstTheme,
+  context: any,
+): Box {
+  const ctx = context as any;
+  const isError = !!ctx?.isError || !!(result as any)?.isError;
+  burstTracker.recordResult(ctx?.toolCallId, result, isError);
+  const details = result?.details as ApplyPatchDetails | undefined;
+  const renderedDiffs = details?.diffs
+    .map(
+      ({ path, diff }) =>
+        `${theme.fg("muted", path)}\n${renderDiff(diff, { filePath: path })}`,
+    )
+    .join("\n\n");
+  const text =
+    renderedDiffs ??
+    (details?.changedPaths.length
+      ? `Updated ${details.changedPaths.join(", ")}`
+      : (result?.content ?? [])
+          .map((item: any) => (item.type === "text" ? item.text : ""))
+          .join("\n"));
+  return burstBox(theme, false, isError, text || "(no output)");
+}
+
+function webSearchDefaultRenderCall(
+  commands: unknown,
+  theme: BurstTheme,
+  context: any,
+): Box {
+  const { pending, isError } = burstTracker.solo(
+    context?.toolCallId,
+    "web_search",
+    commands,
+    context?.invalidate,
+  );
+  const header = `${theme.fg("toolTitle", theme.bold("web_search"))} ${theme.fg("muted", webSearchLabel(commands))}`;
+  return burstBox(theme, pending, isError, header);
+}
+
+function webSearchDefaultRenderResult(
+  result: any,
+  theme: BurstTheme,
+  context: any,
+): Box {
+  const ctx = context as any;
+  const isError = !!ctx?.isError || !!(result as any)?.isError;
+  burstTracker.recordResult(ctx?.toolCallId, result, isError);
+  const rawOutput = (result?.details as WebSearchDetails | undefined)?.rawOutput;
+  const output =
+    ctx?.expanded && rawOutput
+      ? rawOutput
+      : (result?.content ?? [])
+          .map((item: any) => (item.type === "text" ? item.text : ""))
+          .join("\n");
+  const visible =
+    ctx?.expanded || output.length <= 2_000
+      ? output
+      : `${output.slice(0, 2_000).trimEnd()}\n…`;
+  return burstBox(theme, false, isError, visible || "(no output)");
+}
+
 async function readPatchFile(cwd: string, path: string): Promise<string> {
   try {
     return await readFile(resolve(cwd, path), "utf8");
@@ -561,6 +644,9 @@ export default function piCodex(pi: ExtensionAPI) {
     },
     renderShell: "self",
     renderCall(commands, theme, context) {
+      // Without clean-tui, render in the standalone edit-like style.
+      if (!isCleanTuiActive())
+        return webSearchDefaultRenderCall(commands, theme, context);
       const ctx = context as any;
       const view = burstTracker.view(
         ctx?.toolCallId,
@@ -597,6 +683,8 @@ export default function piCodex(pi: ExtensionAPI) {
       return burstBox(theme, pending, isError, header);
     },
     renderResult(result, _options, _theme, context) {
+      if (!isCleanTuiActive())
+        return webSearchDefaultRenderResult(result, _theme, context);
       const ctx = context as any;
       burstTracker.recordResult(
         ctx?.toolCallId,
@@ -687,6 +775,9 @@ export default function piCodex(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme, context) {
+      // Without clean-tui, render in the standalone edit-like style.
+      if (!isCleanTuiActive())
+        return applyPatchDefaultRenderCall(args, theme, context);
       const ctx = context as any;
       const patch = (args as { patch: string }).patch;
       const view = burstTracker.view(
@@ -731,6 +822,8 @@ export default function piCodex(pi: ExtensionAPI) {
     },
 
     renderResult(result, _options, _theme, context) {
+      if (!isCleanTuiActive())
+        return applyPatchDefaultRenderResult(result, _theme, context);
       const ctx = context as any;
       burstTracker.recordResult(
         ctx?.toolCallId,

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BurstTracker } from "../src/clean-burst.ts";
+import {
+  BurstTracker,
+  CLEAN_TUI_ACTIVE,
+  isCleanTuiActive,
+} from "../src/clean-burst.ts";
 
 type Handler = (event: any, ctx: any) => void;
 
@@ -18,6 +22,16 @@ function fakePi() {
   };
   return pi;
 }
+
+test("isCleanTuiActive follows the goodies integration flag", () => {
+  const globals = globalThis as Record<symbol, unknown>;
+  delete globals[CLEAN_TUI_ACTIVE];
+  assert.equal(isCleanTuiActive(), false);
+  globals[CLEAN_TUI_ACTIVE] = true;
+  assert.equal(isCleanTuiActive(), true);
+  delete globals[CLEAN_TUI_ACTIVE];
+  assert.equal(isCleanTuiActive(), false);
+});
 
 const PATCH = "*** Begin Patch\n*** Add File: x.ts\n+x\n*** End Patch";
 

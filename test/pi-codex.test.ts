@@ -61,6 +61,7 @@ import {
   resolveWebSearchUrl,
   summarizeWebSearchCommands,
 } from "../src/web-search.ts";
+import { CLEAN_TUI_ACTIVE } from "../src/clean-burst.ts";
 
 function run(executable: string, args: string[], cwd: string, input?: string) {
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
@@ -92,6 +93,17 @@ function renderCtx(toolCallId: string, expanded = false) {
     argsComplete: true,
     invalidate: () => {},
   } as any;
+}
+
+/** Run fn with the goodies clean-tui integration flag set (burst rendering). */
+function withCleanTui(fn: () => void): void {
+  const globals = globalThis as Record<symbol, unknown>;
+  globals[CLEAN_TUI_ACTIVE] = true;
+  try {
+    fn();
+  } finally {
+    delete globals[CLEAN_TUI_ACTIVE];
+  }
 }
 
 test("uses the upstream freeform apply_patch grammar", () => {
@@ -271,31 +283,75 @@ test("standalone web search executes through the subrouter and renders as a Pi t
     assert.deepEqual(body.commands.search_query, [{ q: "OpenAI Codex" }]);
     assert.equal(result.details.endpoint, requestedUrl);
 
-    // Burst rendering: the collapsed call hides the output; after renderResult
-    // records the result, an expanded renderCall shows the raw output.
-    const rowCtx = renderCtx("search-1");
-    const collapsed = webSearch.renderCall(
+    // Burst rendering (clean-tui active): the collapsed call hides the output;
+    // after renderResult records the result, an expanded renderCall shows the
+    // raw output.
+    withCleanTui(() => {
+      const rowCtx = renderCtx("search-1");
+      const collapsed = webSearch.renderCall(
+        { search_query: [{ q: "OpenAI Codex" }], response_length: "short" },
+        renderTheme(),
+        rowCtx,
+      );
+      webSearch.renderResult(
+        result,
+        { expanded: false, isPartial: false },
+        renderTheme(),
+        rowCtx,
+      );
+      const collapsedText = stripVTControlCharacters(collapsed.render(120).join("\n"));
+      assert.doesNotMatch(collapsedText, /Search result with source/);
+      rowCtx.expanded = true;
+      const expanded = webSearch.renderCall(
+        { search_query: [{ q: "OpenAI Codex" }], response_length: "short" },
+        renderTheme(),
+        rowCtx,
+      );
+      assert.match(
+        stripVTControlCharacters(expanded.render(120).join("\n")),
+        /Search result with source https:\/\/example\.com/,
+      );
+    });
+
+    // Default rendering (no clean-tui): the output stays visible, collapsed
+    // to 2000 chars; expansion shows the raw output.
+    const defaultCtx = renderCtx("search-default");
+    webSearch.renderCall(
       { search_query: [{ q: "OpenAI Codex" }], response_length: "short" },
       renderTheme(),
-      rowCtx,
+      defaultCtx,
     );
-    webSearch.renderResult(
+    const defaultCollapsed = webSearch.renderResult(
       result,
       { expanded: false, isPartial: false },
       renderTheme(),
-      rowCtx,
+      defaultCtx,
     );
-    const collapsedText = stripVTControlCharacters(collapsed.render(120).join("\n"));
-    assert.doesNotMatch(collapsedText, /Search result with source/);
-    rowCtx.expanded = true;
-    const expanded = webSearch.renderCall(
-      { search_query: [{ q: "OpenAI Codex" }], response_length: "short" },
+    const defaultText = stripVTControlCharacters(defaultCollapsed.render(120).join("\n"));
+    assert.match(defaultText, /Search result with source https:\/\/example\.com/);
+    const oversizedSample = {
+      content: [{ type: "text", text: "x".repeat(2_500) }],
+      details: { rawOutput: "raw search output" },
+    };
+    const truncated = webSearch.renderResult(
+      oversizedSample,
+      { expanded: false, isPartial: false },
       renderTheme(),
-      rowCtx,
+      defaultCtx,
+    );
+    const truncatedText = stripVTControlCharacters(truncated.render(120).join("\n"));
+    assert.match(truncatedText, /…/);
+    assert.doesNotMatch(truncatedText, /raw search output/);
+    defaultCtx.expanded = true;
+    const defaultExpanded = webSearch.renderResult(
+      oversizedSample,
+      { expanded: true, isPartial: false },
+      renderTheme(),
+      defaultCtx,
     );
     assert.match(
-      stripVTControlCharacters(expanded.render(120).join("\n")),
-      /Search result with source https:\/\/example\.com/,
+      stripVTControlCharacters(defaultExpanded.render(120).join("\n")),
+      /raw search output/,
     );
 
     const oversized = "x".repeat(60_000);
@@ -396,28 +452,43 @@ test("apply_patch captures display-oriented diffs from actual file changes", asy
     assert.match(result.details.diffs[0].diff, /-1 hello/);
     assert.match(result.details.diffs[0].diff, /\+1 hello colored diff/);
     initTheme(undefined, false);
-    // Burst rendering: collapsed header shows the touched paths only; the
-    // diff appears once the row is expanded.
-    const theme = renderTheme();
-    const rowCtx = renderCtx("call-1");
-    const collapsed = tool.renderCall(
-      { patch: "*** Begin Patch\n*** Update File: hello.txt\n@@\n-hello\n+hello colored diff\n*** End Patch" },
-      theme,
-      rowCtx,
+    const patch =
+      "*** Begin Patch\n*** Update File: hello.txt\n@@\n-hello\n+hello colored diff\n*** End Patch";
+    // Burst rendering (clean-tui active): collapsed header shows the touched
+    // paths only; the diff appears once the row is expanded.
+    withCleanTui(() => {
+      const theme = renderTheme();
+      const rowCtx = renderCtx("call-1");
+      const collapsed = tool.renderCall({ patch }, theme, rowCtx);
+      tool.renderResult(result, { expanded: false, isPartial: false }, theme, rowCtx);
+      const collapsedText = stripVTControlCharacters(collapsed.render(120).join("\n"));
+      assert.match(collapsedText, /apply_patch hello\.txt/);
+      assert.doesNotMatch(collapsedText, /hello colored diff/);
+      rowCtx.expanded = true;
+      const rendered = tool.renderCall({ patch }, theme, rowCtx);
+      const renderedText = rendered.render(120).join("\n");
+      assert.match(stripVTControlCharacters(renderedText), /hello colored diff/);
+      assert.match(renderedText, /\u001b\[/);
+    });
+
+    // Default rendering (no clean-tui): edit-like — the diff stays visible
+    // in the result row without expansion.
+    const defaultTheme = renderTheme();
+    const defaultCtx = renderCtx("call-default");
+    const defaultCall = tool.renderCall({ patch }, defaultTheme, defaultCtx);
+    assert.match(
+      stripVTControlCharacters(defaultCall.render(120).join("\n")),
+      /apply_patch hello\.txt/,
     );
-    tool.renderResult(result, { expanded: false, isPartial: false }, theme, rowCtx);
-    const collapsedText = stripVTControlCharacters(collapsed.render(120).join("\n"));
-    assert.match(collapsedText, /apply_patch hello\.txt/);
-    assert.doesNotMatch(collapsedText, /hello colored diff/);
-    rowCtx.expanded = true;
-    const rendered = tool.renderCall(
-      { patch: "*** Begin Patch\n*** Update File: hello.txt\n@@\n-hello\n+hello colored diff\n*** End Patch" },
-      theme,
-      rowCtx,
+    const defaultRendered = tool.renderResult(
+      result,
+      { expanded: false, isPartial: false },
+      defaultTheme,
+      defaultCtx,
     );
-    const renderedText = rendered.render(120).join("\n");
-    assert.match(stripVTControlCharacters(renderedText), /hello colored diff/);
-    assert.match(renderedText, /\u001b\[/);
+    const defaultText = defaultRendered.render(120).join("\n");
+    assert.match(stripVTControlCharacters(defaultText), /hello colored diff/);
+    assert.match(defaultText, /\u001b\[/);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
