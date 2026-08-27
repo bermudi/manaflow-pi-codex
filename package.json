@@ -1,6 +1,6 @@
 {
   "name": "@bermudi/pi-codex",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Codex-native apply_patch, web search, and remote compaction for pi",
   "type": "module",
   "license": "MIT",
