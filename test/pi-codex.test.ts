@@ -428,6 +428,7 @@ test("patch paths display relative to cwd, ~ under home, absolute elsewhere", ()
   );
   assert.deepEqual(patchDisplayPaths(patch(["/etc/hosts"]), cwd), ["/etc/hosts"]);
   assert.deepEqual(patchDisplayPaths(patch(["/etc/hosts"]), undefined), ["/etc/hosts"]);
+  assert.deepEqual(patchDisplayPaths(patch(["docs/new.md"]), `${cwd}/`), ["docs/new.md"]);
   assert.equal(displayPath(".", cwd), ".");
 });
 
@@ -455,6 +456,17 @@ test("call headers keep a single file inline and nest multi-file lists", () => {
     applyPatchCallHeader(multi, title, plainTheme, "/cwd"),
     "apply_patch\n  a.md\n  b.md",
   );
+});
+
+test("path cap boundary: eight paths show no tail, nine do", () => {
+  const patch = (n: number) =>
+    `*** Begin Patch\n${Array.from({ length: n }, (_, i) => `*** Update File: f${i}.md`).join("\n")}\n*** End Patch`;
+  const eight = applyPatchCallHeader(patch(8), "apply_patch", plainTheme, "/cwd").split("\n");
+  assert.equal(eight.length, 9);
+  assert.equal(eight.at(-1), "  f7.md");
+  const nine = applyPatchCallHeader(patch(9), "apply_patch", plainTheme, "/cwd").split("\n");
+  assert.equal(nine.length, 9);
+  assert.equal(nine.at(-1), "  … +2 more");
 });
 
 test("path lists cap at eight lines with a muted tail", () => {

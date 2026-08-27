@@ -321,9 +321,10 @@ function shortenHome(path: string): string {
 
 function displayPath(path: string, cwd: string | undefined): string {
   if (!cwd) return shortenHome(path);
-  const abs = resolve(cwd, path);
-  if (abs === cwd) return ".";
-  if (abs.startsWith(`${cwd}/`)) return abs.slice(cwd.length + 1);
+  const base = resolve(cwd);
+  const abs = resolve(base, path);
+  if (abs === base) return ".";
+  if (abs.startsWith(`${base}/`)) return abs.slice(base.length + 1);
   return shortenHome(abs);
 }
 
