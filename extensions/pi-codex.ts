@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum, type Model } from "@earendil-works/pi-ai";
@@ -304,12 +305,71 @@ function pathsFromPatch(patch: string): string[] {
 // ── Clean burst rendering (mirrors bermudis-pi-goodies clean-tui.ts) ──
 const burstTracker = new BurstTracker();
 
-function applyPatchLabel(patch: string): string {
-  return pathsFromPatch(patch).join(", ") || "patch";
+// ── Patch path display ──
+// apply_patch paths resolve against the session cwd (Codex applies them
+// there). Collapsed rows show them relative to cwd when possible, else
+// ~-anchored, so multi-file bursts stay scannable instead of wrapping
+// absolute paths mid-word.
+const MAX_PATCH_PATH_LINES = 8;
+
+function shortenHome(path: string): string {
+  const home = homedir();
+  if (path === home) return "~";
+  if (path.startsWith(`${home}/`)) return `~${path.slice(home.length)}`;
+  return path;
 }
 
-function applyPatchBullet(entry: any, theme: BurstTheme): string {
-  return burstBullet(theme, applyPatchLabel(entry.args?.patch ?? ""), entry.isError);
+function displayPath(path: string, cwd: string | undefined): string {
+  if (!cwd) return shortenHome(path);
+  const abs = resolve(cwd, path);
+  if (abs === cwd) return ".";
+  if (abs.startsWith(`${cwd}/`)) return abs.slice(cwd.length + 1);
+  return shortenHome(abs);
+}
+
+function patchDisplayPaths(patch: string, cwd: string | undefined): string[] {
+  return pathsFromPatch(patch).map((path) => displayPath(path, cwd));
+}
+
+function cappedPaths(paths: string[]): { shown: string[]; hidden: number } {
+  if (paths.length <= MAX_PATCH_PATH_LINES) return { shown: paths, hidden: 0 };
+  return {
+    shown: paths.slice(0, MAX_PATCH_PATH_LINES - 1),
+    hidden: paths.length - (MAX_PATCH_PATH_LINES - 1),
+  };
+}
+
+function applyPatchLabel(patch: string, cwd?: string): string {
+  return patchDisplayPaths(patch, cwd).join(", ") || "patch";
+}
+
+/** `title` plus one short path per line (single path stays on the title line). */
+function applyPatchCallHeader(
+  patch: string,
+  title: string,
+  theme: BurstTheme,
+  cwd?: string,
+): string {
+  const paths = patchDisplayPaths(patch, cwd);
+  if (paths.length <= 1) {
+    return `${title} ${theme.fg("accent", paths[0] ?? "patch")}`;
+  }
+  const { shown, hidden } = cappedPaths(paths);
+  const lines = shown.map((path) => `  ${theme.fg("accent", path)}`);
+  if (hidden > 0) lines.push(`  ${theme.fg("muted", `… +${hidden} more`)}`);
+  return `${title}\n${lines.join("\n")}`;
+}
+
+function applyPatchBullet(entry: any, theme: BurstTheme, cwd?: string): string {
+  const paths = patchDisplayPaths(entry.args?.patch ?? "", cwd);
+  if (!paths.length) return burstBullet(theme, "patch", entry.isError);
+  const { shown, hidden } = cappedPaths(paths);
+  const accent = entry.isError ? "error" : "accent";
+  // burstBullet's `  • ` prefix is four columns; continuations align under it.
+  const lines = [burstBullet(theme, shown[0], entry.isError)];
+  for (const path of shown.slice(1)) lines.push(`    ${theme.fg(accent, path)}`);
+  if (hidden > 0) lines.push(`    ${theme.fg("muted", `… +${hidden} more`)}`);
+  return lines.join("\n");
 }
 
 function webSearchLabel(commands: unknown): string {
@@ -346,7 +406,8 @@ function applyPatchDefaultRenderCall(
     args,
     context?.invalidate,
   );
-  const header = `${theme.fg("toolTitle", theme.bold("apply_patch"))} ${theme.fg("accent", applyPatchLabel(args?.patch ?? ""))}`;
+  const title = theme.fg("toolTitle", theme.bold("apply_patch"));
+  const header = applyPatchCallHeader(args?.patch ?? "", title, theme, context?.cwd);
   return burstBox(theme, pending, isError, header);
 }
 
@@ -356,19 +417,20 @@ function applyPatchDefaultRenderResult(
   context: any,
 ): Box {
   const ctx = context as any;
+  const cwd = typeof ctx?.cwd === "string" ? ctx.cwd : undefined;
   const isError = !!ctx?.isError || !!(result as any)?.isError;
   burstTracker.recordResult(ctx?.toolCallId, result, isError);
   const details = result?.details as ApplyPatchDetails | undefined;
   const renderedDiffs = details?.diffs
     .map(
       ({ path, diff }) =>
-        `${theme.fg("muted", path)}\n${renderDiff(diff, { filePath: path })}`,
+        `${theme.fg("muted", displayPath(path, cwd))}\n${renderDiff(diff, { filePath: path })}`,
     )
     .join("\n\n");
   const text =
     renderedDiffs ??
     (details?.changedPaths.length
-      ? `Updated ${details.changedPaths.join(", ")}`
+      ? `Updated ${details.changedPaths.map((path) => displayPath(path, cwd)).join(", ")}`
       : (result?.content ?? [])
           .map((item: any) => (item.type === "text" ? item.text : ""))
           .join("\n"));
@@ -801,6 +863,7 @@ export default function piCodex(pi: ExtensionAPI) {
       if (!isCleanTuiActive())
         return applyPatchDefaultRenderCall(args, theme, context);
       const ctx = context as any;
+      const cwd = typeof ctx?.cwd === "string" ? ctx.cwd : undefined;
       const patch = (args as { patch: string }).patch;
       const view = burstTracker.view(
         ctx?.toolCallId,
@@ -816,14 +879,14 @@ export default function piCodex(pi: ExtensionAPI) {
       let header: string;
       if (burst.length > 1) {
         header = `${title} ${theme.fg("muted", `×${burst.length}`)}`;
-        header += `\n${burst.map((e) => applyPatchBullet(e, theme)).join("\n")}`;
+        header += `\n${burst.map((e) => applyPatchBullet(e, theme, cwd)).join("\n")}`;
       } else {
-        header = `${title} ${theme.fg("accent", applyPatchLabel(patch))}`;
+        header = applyPatchCallHeader(patch, title, theme, cwd);
       }
       if (ctx?.expanded) {
         const blocks: string[] = [];
         for (const e of burst) {
-          const label = applyPatchLabel(e.args?.patch ?? "");
+          const label = applyPatchLabel(e.args?.patch ?? "", cwd);
           if (!e.result) {
             if (burst.length > 1)
               blocks.push(theme.fg("warning", `— ${label}: pending`));
@@ -835,7 +898,7 @@ export default function piCodex(pi: ExtensionAPI) {
             const body = diffs
               .map(
                 ({ path, diff }) =>
-                  `${theme.fg("muted", path)}\n${renderDiff(diff, { filePath: path })}`,
+                  `${theme.fg("muted", displayPath(path, cwd))}\n${renderDiff(diff, { filePath: path })}`,
               )
               .join("\n\n");
             blocks.push(`\n${theme.fg("muted", `— ${label}`)}:\n${body}`);
@@ -1118,6 +1181,8 @@ export default function piCodex(pi: ExtensionAPI) {
 }
 
 export {
+  applyPatchBullet,
+  applyPatchCallHeader,
   applyPatchGrammar,
   changedPathsFromOutput,
   CODEX_FAST_MODE_MODELS,
@@ -1127,11 +1192,13 @@ export {
   CODEX_SOL_RESERVE_TOKENS,
   codexAutoCompactLimit,
   codexCompactionReserve,
+  displayPath,
   formatWorkingElapsed,
   installCompactCompactionRenderer,
   isCodexModel,
   isCodexSolModel,
   isOpenAICodexModel,
+  patchDisplayPaths,
   pathsFromPatch,
   supportsCodexFastMode,
 };

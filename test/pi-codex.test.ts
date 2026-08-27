@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
@@ -14,6 +14,8 @@ import {
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import piCodex, {
+  applyPatchBullet,
+  applyPatchCallHeader,
   applyPatchGrammar,
   changedPathsFromOutput,
   CODEX_FAST_SERVICE_TIER,
@@ -21,9 +23,11 @@ import piCodex, {
   CODEX_SOL_CONTEXT_WINDOW,
   CODEX_SOL_RESERVE_TOKENS,
   codexAutoCompactLimit,
+  displayPath,
   formatWorkingElapsed,
   installCompactCompactionRenderer,
   isCodexModel,
+  patchDisplayPaths,
   pathsFromPatch,
   supportsCodexFastMode,
 } from "../extensions/pi-codex.ts";
@@ -402,6 +406,66 @@ test("extracts all source and destination paths from an apply patch", () => {
     ),
     ["old.ts", "new.ts", "added.ts"],
   );
+});
+
+const plainTheme = {
+  fg: (_color: string, text: string) => text,
+  bg: (_color: string, text: string) => text,
+  bold: (text: string) => text,
+};
+
+test("patch paths display relative to cwd, ~ under home, absolute elsewhere", () => {
+  const cwd = `${homedir()}/Desktop/Clients/recam-laser-international`;
+  const patch = (files: string[]) =>
+    `*** Begin Patch\n${files.map((f) => `*** Update File: ${f}`).join("\n")}\n*** End Patch`;
+  assert.deepEqual(
+    patchDisplayPaths(patch([`${cwd}/README.md`, "docs/new.md"]), cwd),
+    ["README.md", "docs/new.md"],
+  );
+  assert.deepEqual(
+    patchDisplayPaths(patch([`${homedir()}/notes.md`]), cwd),
+    ["~/notes.md"],
+  );
+  assert.deepEqual(patchDisplayPaths(patch(["/etc/hosts"]), cwd), ["/etc/hosts"]);
+  assert.deepEqual(patchDisplayPaths(patch(["/etc/hosts"]), undefined), ["/etc/hosts"]);
+  assert.equal(displayPath(".", cwd), ".");
+});
+
+test("burst bullets put each patched file on its own aligned line", () => {
+  const patch =
+    "*** Begin Patch\n*** Update File: a.md\n@@\n*** Update File: b.md\n@@\n*** End Patch";
+  assert.equal(
+    applyPatchBullet({ args: { patch }, isError: false }, plainTheme, "/cwd"),
+    "  • a.md\n    b.md",
+  );
+  assert.equal(
+    applyPatchBullet({ args: { patch: "" }, isError: true }, plainTheme, "/cwd"),
+    "  • patch",
+  );
+});
+
+test("call headers keep a single file inline and nest multi-file lists", () => {
+  const title = "apply_patch";
+  assert.equal(
+    applyPatchCallHeader("*** Begin Patch\n*** Update File: a.md\n*** End Patch", title, plainTheme, "/cwd"),
+    "apply_patch a.md",
+  );
+  const multi = "*** Begin Patch\n*** Update File: a.md\n*** Update File: b.md\n*** End Patch";
+  assert.equal(
+    applyPatchCallHeader(multi, title, plainTheme, "/cwd"),
+    "apply_patch\n  a.md\n  b.md",
+  );
+});
+
+test("path lists cap at eight lines with a muted tail", () => {
+  const files = Array.from({ length: 12 }, (_, i) => `f${i}.md`);
+  const patch = `*** Begin Patch\n${files.map((f) => `*** Update File: ${f}`).join("\n")}\n*** End Patch`;
+  const headerLines = applyPatchCallHeader(patch, "apply_patch", plainTheme, "/cwd").split("\n");
+  assert.equal(headerLines.length, 9);
+  assert.equal(headerLines.at(-1), "  … +5 more");
+  const bulletLines = applyPatchBullet({ args: { patch }, isError: false }, plainTheme, "/cwd").split("\n");
+  assert.equal(bulletLines.length, 8);
+  assert.equal(bulletLines.at(-1), "    … +5 more");
 });
 
 test("renders collapsed compaction status on one content line", () => {
