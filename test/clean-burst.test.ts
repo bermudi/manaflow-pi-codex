@@ -322,6 +322,29 @@ test("a single-call burst refreshes its own box when the result arrives", async 
   assert.equal(invalidations, 1);
 });
 
+test("solo rows refresh themselves instead of a calculated burst leader", async () => {
+  const pi = fakePi();
+  const tracker = new BurstTracker();
+  tracker.registerHandlers(pi);
+  startSession(pi);
+  startAssistantMessage(pi, [toolCall("a"), toolCall("b")]);
+
+  let aInvalidations = 0;
+  let bInvalidations = 0;
+  tracker.solo("a", "apply_patch", { patch: PATCH }, () => aInvalidations++);
+  tracker.solo("b", "apply_patch", { patch: PATCH }, () => bInvalidations++);
+  // The two rows are adjacent and groupable in the entries array, but solo
+  // rendering disables grouping: completing b must refresh b's own row.
+  tracker.recordResult(
+    "b",
+    { content: [{ type: "text", text: "ok" }] },
+    false,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bInvalidations, 1);
+  assert.equal(aInvalidations, 0);
+});
+
 test("recordResult ignores repeated wrappers (no render churn)", () => {
   const pi = fakePi();
   const tracker = new BurstTracker();

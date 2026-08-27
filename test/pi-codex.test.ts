@@ -1411,3 +1411,97 @@ test("standalone result rows render once while pi is mid-render", async () => {
   assert.equal(occurrences(component.render(120), "failed diagnostic"), 1);
   assert.equal(occurrences(component.render(120), "x.ts"), 1);
 });
+
+test("second standalone call refreshes its own header after completing", async () => {
+  const { ToolExecutionComponent } = await import(
+    "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js"
+  );
+  initTheme(undefined, false);
+
+  const tools = new Map<string, any>();
+  const handlers = new Map<string, Array<(...args: any[]) => unknown>>();
+  const pi = {
+    registerCommand() {},
+    registerTool(definition: any) {
+      tools.set(definition.name, definition);
+    },
+    getActiveTools: () => ["apply_patch"],
+    getAllTools: () => [...tools.values()],
+    setActiveTools() {},
+    on(name: string, handler: (...args: any[]) => unknown) {
+      const list = handlers.get(name) ?? [];
+      list.push(handler);
+      handlers.set(name, list);
+    },
+  } as unknown as ExtensionAPI;
+  piCodex(pi);
+  const emit = (name: string, event?: any, ctx?: any) => {
+    for (const handler of handlers.get(name) ?? []) handler(event, ctx);
+  };
+  const applyPatch = tools.get("apply_patch");
+  assert.ok(applyPatch);
+
+  // Two adjacent standalone calls are groupable in the tracker's entries;
+  // solo rendering must ignore that and refresh the changed row itself.
+  emit("session_start", {}, {
+    sessionManager: { getBranch: () => [] },
+    hasUI: false,
+  });
+  emit("agent_start", {}, { hasUI: false });
+  emit("message_start", {
+    message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "sa-1", name: "apply_patch" },
+        { type: "toolCall", id: "sa-2", name: "apply_patch" },
+      ],
+    },
+  });
+  const PATCH =
+    "*** Begin Patch\n*** Add File: x.ts\n+x\n*** End Patch";
+  const mkComponent = (id: string) =>
+    new ToolExecutionComponent(
+      "apply_patch",
+      id,
+      { patch: PATCH },
+      {},
+      applyPatch,
+      { requestRender() {} } as any,
+      process.cwd(),
+    );
+  const first = mkComponent("sa-1");
+  const second = mkComponent("sa-2");
+  const errorResult = {
+    content: [{ type: "text", text: "failed diagnostic" }],
+    isError: true,
+  };
+  const render = (c: InstanceType<typeof ToolExecutionComponent>) =>
+    c.render(120).join("\n");
+
+  const firstBefore = render(first);
+  first.updateResult(errorResult, false);
+  await new Promise((resolve) => setImmediate(resolve));
+  const firstRefreshed = render(first);
+  assert.match(stripVTControlCharacters(firstRefreshed), /failed diagnostic/);
+  // The first row's header repainted after its own result.
+  assert.notEqual(firstRefreshed, firstBefore);
+
+  second.updateResult(errorResult, false);
+  // Immediately after the result pi has drawn the header with the pending
+  // background (renderCall ran before renderResult).
+  const secondMidRender = render(second);
+  await new Promise((resolve) => setImmediate(resolve));
+  const secondRefreshed = render(second);
+  // The second row's header must repaint (pending -> error background); with
+  // the calculated-leader refresh it stayed pending forever.
+  assert.notEqual(secondRefreshed, secondMidRender);
+  // No duplicate output from the deferred refresh.
+  assert.equal(
+    stripVTControlCharacters(secondRefreshed).split("failed diagnostic").length - 1,
+    1,
+  );
+  assert.equal(
+    stripVTControlCharacters(firstRefreshed).split("failed diagnostic").length - 1,
+    1,
+  );
+});

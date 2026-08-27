@@ -87,6 +87,13 @@ export type BurstEntry = {
   index: number;
   result?: { content: Array<{ type: string; text?: string }>; details?: any };
   isError?: boolean;
+  /**
+   * Last rendered through solo(): the row displays itself, so a result must
+   * refresh the row itself — not a calculated burst leader, which for
+   * standalone rows may be an unrelated adjacent entry. view() clears the
+   * mark, so the flag always reflects how the row is currently displayed.
+   */
+  solo?: boolean;
   /** Content array of the last result seen; detects real mutations vs re-renders. */
   contentRef?: unknown;
 };
@@ -337,6 +344,7 @@ export class BurstTracker {
   ): { pending: boolean; isError: boolean } {
     if (!toolCallId) return { pending: true, isError: false };
     const entry = this.upsert(toolCallId, toolName, args, invalidate);
+    entry.solo = true;
     return { pending: !entry.result, isError: !!entry.isError };
   }
 
@@ -364,6 +372,7 @@ export class BurstTracker {
       return { entry: pseudo, burst: [pseudo] };
     }
     const entry = this.upsert(toolCallId, toolName, args, invalidate);
+    entry.solo = false;
 
     const idx = entry.index;
     let start = idx;
@@ -386,17 +395,22 @@ export class BurstTracker {
   }
 
   /**
-   * Call from renderResult. Records the result and revalidates the run's
-   * leader (an arriving result surfaces pending/error state on the leader's
-   * aggregated box). pi's updateDisplay invokes renderCall before
-   * renderResult, so the box the leader just drew still shows the pre-result
-   * state, and a single-call burst has no neighbors to refresh it — the
-   * leader must be re-invalidated. When the leader IS the changed row, the
-   * invalidation is deferred to a microtask: invalidating synchronously
-   * re-enters updateDisplay mid-render, and the outer render then appends
-   * its result a second time (standalone rows showed their output twice
-   * until the next redraw). The contentRef guard turns the eventual
-   * re-entry's recordResult into a no-op, so this cannot churn.
+   * Call from renderResult. Records the result and revalidates the row(s)
+   * whose rendering depends on it. pi's updateDisplay invokes renderCall
+   * before renderResult, so the box the row just drew still shows the
+   * pre-result state — something must re-invalidate after the record:
+   *
+   * - solo() rows display themselves, so the changed row refreshes itself
+   *   (deferred: a synchronous self-invalidation re-enters updateDisplay
+   *   mid-render and the outer render appends its result a second time).
+   *   The calculated burst leader is deliberately ignored — for standalone
+   *   rows it may be an unrelated adjacent entry.
+   * - burst rows render through their leader's aggregated box, so the run's
+   *   leader refreshes; deferred when the leader IS the changed row, for
+   *   the same re-entrancy reason.
+   *
+   * The contentRef guard turns any re-entry's recordResult into a no-op, so
+   * none of this can churn.
    */
   recordResult(
     toolCallId: string | undefined,
@@ -410,10 +424,13 @@ export class BurstTracker {
     entry.result = result;
     entry.isError = isError;
     const [leaderIdx] = this.runAround(entry.index);
-    const fn = this.invalidates.get(this.entries[leaderIdx].toolCallId);
+    const target = entry.solo
+      ? entry
+      : this.entries[leaderIdx];
+    const fn = this.invalidates.get(target.toolCallId);
     if (!fn) return;
-    if (leaderIdx === entry.index) {
-      // The leader is the row pi is currently rendering — defer past it.
+    if (target === entry) {
+      // The refreshed row is the one pi is currently rendering — defer.
       queueMicrotask(fn);
     } else {
       fn();
