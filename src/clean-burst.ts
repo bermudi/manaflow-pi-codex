@@ -1,13 +1,30 @@
 /**
  * Burst-style rendering for pi-codex tools, mirroring bermudis-pi-goodies'
- * clean-tui.ts: same-tool calls within one assistant message collapse into a
- * single box, results stay hidden until expanded, and an assistant message
- * always closes the open burst.
+ * clean-tui.ts: same-tool calls collapse into a single box, results stay
+ * hidden until expanded, and visible prose closes the open burst.
  *
- * The assistant-message boundary is what keeps the transcript chronological.
- * pi streams a message's prose before that message's tool components render;
- * a tracker without the boundary accumulates every same-tool call of an
- * entire agent run into one block displayed at the first call's position.
+ * Two boundaries keep the transcript chronological:
+ *
+ * - Prose segments (mirroring goodies): a segment opens when visible text
+ *   appears — assistant prose or a typed user message. Textless assistant
+ *   messages (thinking + tool calls only) chain into the open segment, so a
+ *   model calling tools one per message still groups; the moment real prose
+ *   renders, the burst closes. Without any boundary, every same-tool call of
+ *   an entire agent run accumulates into one block at the first call's
+ *   position.
+ *
+ * - Foreign-row barriers: two calls may only group when no OTHER tool row
+ *   sits between them. The tracker only sees its own tools' renderCall, so
+ *   it derives adjacency from the assistant message's block order: each
+ *   entry records how many different-tool toolCall blocks precede it within
+ *   its segment (across chained messages). Equal barriers ⟺ nothing of
+ *   another tool in between, so hiding a follower can never reorder the
+ *   transcript (apply_patch → read → apply_patch stays three rows).
+ *
+ * Extensions receive message events before pi creates the row components
+ * (agent-session emits to extensions first, then to listeners), so the
+ * streaming message already contains a call's block by the time its
+ * renderCall runs.
  *
  * State is intentionally module-local per instance (one tracker per
  * extension load). Cross-tool grouping never happens (grouping requires an
@@ -15,6 +32,20 @@
  * clean-tui's.
  */
 import { Box, Container, Text } from "@earendil-works/pi-tui";
+
+/**
+ * A message shows visible prose when it has a non-empty text block. Thinking
+ * blocks and tool calls don't count — they render as rows, not prose, and
+ * must not close a burst. Mirrors goodies' clean-tui hasVisibleText.
+ */
+function hasVisibleText(message: any): boolean {
+  return (message?.content ?? []).some(
+    (b: any) =>
+      b?.type === "text" &&
+      typeof b.text === "string" &&
+      b.text.trim().length > 0,
+  );
+}
 
 /**
  * Process-global flag contract with bermudis-pi-goodies/clean-tui: while the
@@ -38,12 +69,20 @@ export type BurstEntry = {
   toolName: string;
   args: any;
   /**
-   * Assistant-message boundary: live entries count up from 1 (bumped on each
-   * assistant message_start); replayed entries count down from -1 (one per
-   * assistant message in the restored branch). NaN = unknown lineage — never
-   * groups.
+   * Prose-segment boundary (mirrors goodies' clean-tui): live entries count
+   * up (bumped when visible prose appears — assistant text or a typed user
+   * message); replayed entries count down from -1 (one per prose boundary in
+   * the restored branch, so replay segments stay negative and can never
+   * merge with live ones). NaN = unknown lineage — never groups.
    */
   seg: number;
+  /**
+   * Foreign-tool rows preceding this call within its segment, derived from
+   * the assistant messages' block order. Two entries group only when their
+   * barriers are equal — no other tool's row sits between them. NaN =
+   * adjacency unprovable — never groups.
+   */
+  barrier: number;
   /** Position in `entries`; stable because entries are append-only. */
   index: number;
   result?: { content: Array<{ type: string; text?: string }>; details?: any };
@@ -71,12 +110,15 @@ export type BurstRenderContext = {
 };
 
 function shouldGroup(a: BurstEntry, b: BurstEntry): boolean {
-  // Adjacency + same tool within one assistant message. Live segments count
-  // up, replay segments count down — the two domains can never merge. NaN
-  // (unknown lineage) compares unequal to everything, so those rows render
-  // solo.
+  // Adjacency + same tool within one prose segment. Live segments count up,
+  // replay segments count down — the two domains can never merge. Equal
+  // barriers guarantee no foreign-tool row sits between the two calls, so a
+  // hidden follower can never jump above an unrelated row. NaN (unknown
+  // lineage or unprovable adjacency) compares unequal to everything, so
+  // those rows render solo.
   if (a.seg !== b.seg) return false;
   if (a.toolName !== b.toolName) return false;
+  if (a.barrier !== b.barrier) return false;
   return true;
 }
 
@@ -94,13 +136,66 @@ export class BurstTracker {
   private liveSeg = 0;
   private replaying = true;
   private replaySegs = new Map<string, number>();
+  private replayBarriers = new Map<string, number>();
+  /**
+   * Assistant message currently streaming (or last completed). renderCall
+   * consults its block list to place foreign-row barriers; extensions get
+   * message events before pi renders rows, so a call's block is always
+   * present by the time its renderCall runs.
+   */
+  private curMessage: any = undefined;
+  /** Whether the streaming assistant message has shown visible prose. */
+  private curAssistantTextSeen = false;
+  /**
+   * Tool-call names of the assistant messages already folded into the
+   * current live segment. Foreign names between two entries split them,
+   * including across chained textless messages.
+   */
+  private segMsgNames: any[][] = [];
 
   /** Wire the lifecycle handlers a tracker needs on the ExtensionAPI. */
   registerHandlers(pi: {
     on(event: string, handler: (event: any, ctx: any) => void): void;
   }): void {
     pi.on("message_start", (event) => {
-      if (event?.message?.role === "assistant") this.liveSeg++;
+      const message = event?.message;
+      if (!message) return;
+      if (message.role === "assistant") {
+        // Fold the previous assistant message's tool rows into the segment
+        // ledger, then open a new segment if this message carries prose.
+        if (this.curMessage)
+          this.segMsgNames.push(this.messageToolCallNames(this.curMessage));
+        this.curMessage = message;
+        this.curAssistantTextSeen = hasVisibleText(message);
+        if (this.curAssistantTextSeen) {
+          this.liveSeg++;
+          this.segMsgNames = [];
+        }
+      } else if (message.role === "user" && hasVisibleText(message)) {
+        // A typed user message is prose; it must split the surrounding
+        // bursts (mirrors goodies' clean-tui).
+        this.liveSeg++;
+        this.segMsgNames = [];
+      }
+    });
+    pi.on("message_update", (event) => {
+      const message = event?.message;
+      if (message?.role !== "assistant") return;
+      this.curMessage = message;
+      if (!this.curAssistantTextSeen && hasVisibleText(message)) {
+        // Prose streamed mid-message: close the open burst. Extensions see
+        // message_update before pi renders the message's tool rows, and text
+        // precedes tool calls, so this has fired before the first renderCall.
+        this.curAssistantTextSeen = true;
+        this.liveSeg++;
+        this.segMsgNames = [];
+      }
+    });
+    pi.on("message_end", (event) => {
+      // Final content — covers rows pi creates after streaming (the
+      // tool_execution_start fallback path).
+      const message = event?.message;
+      if (message?.role === "assistant") this.curMessage = message;
     });
     pi.on("agent_start", () => {
       // First live run after startup/resume: calls from here on may group.
@@ -112,9 +207,12 @@ export class BurstTracker {
   }
 
   /**
-   * Rebuild replay segmentation from a restored session branch: every
-   * assistant message's tool calls get one segment, mirroring the live rule.
-   * Replay fires no events, so this is the only boundary source for history.
+   * Rebuild replay segmentation from a restored session branch with the same
+   * rules as the live path: visible prose opens a segment (counted down, so
+   * replay segments stay negative and disjoint from live ones), textless
+   * assistant messages chain, and each call records the foreign-tool rows
+   * preceding it within its segment. Replay fires no events, so this is the
+   * only boundary source for history.
    */
   reset(branch: readonly any[]): void {
     this.liveSeg = 0;
@@ -123,25 +221,78 @@ export class BurstTracker {
     this.byId.clear();
     this.invalidates.clear();
     this.replaySegs.clear();
-    let seg = 0;
+    this.replayBarriers.clear();
+    this.curMessage = undefined;
+    this.curAssistantTextSeen = false;
+    this.segMsgNames = [];
+    let seg = -1;
+    let segNames: any[][] = [];
     for (const entry of branch) {
       const message = entry?.type === "message" ? entry.message : undefined;
-      if (message?.role !== "assistant") continue;
-      seg--;
-      for (const block of message.content ?? []) {
-        if (block?.type === "toolCall" && typeof block.id === "string") {
-          this.replaySegs.set(block.id, seg);
+      if (!message) continue;
+      if (message.role === "assistant") {
+        if (hasVisibleText(message)) {
+          seg--;
+          segNames = [];
         }
+        const names: any[] = [];
+        for (const block of message.content ?? []) {
+          if (block?.type !== "toolCall" || typeof block.id !== "string")
+            continue;
+          let barrier = 0;
+          for (const prev of segNames)
+            for (const name of prev)
+              if (name !== block.name) barrier++;
+          for (const name of names)
+            if (name !== block.name) barrier++;
+          this.replaySegs.set(block.id, seg);
+          this.replayBarriers.set(block.id, barrier);
+          names.push(block.name);
+        }
+        if (names.length) segNames.push(names);
+      } else if (message.role === "user" && hasVisibleText(message)) {
+        seg--;
+        segNames = [];
       }
     }
   }
 
+  /** Tool-call names of an assistant message, in content order. */
+  private messageToolCallNames(message: any): any[] {
+    const names: any[] = [];
+    for (const block of message?.content ?? []) {
+      if (block?.type === "toolCall") names.push(block.name);
+    }
+    return names;
+  }
+
   /**
-   * Call from renderCall. Returns the entry's burst view; the caller renders
-   * an empty Container when the entry is a burst follower (the leader carries
-   * the whole block). A missing toolCallId (definition-level rendering, tests)
-   * renders an untracked solo view.
+   * Foreign-tool rows preceding this call within its live segment: counts
+   * different-tool toolCall blocks across the segment's folded messages plus
+   * the ones preceding this block in the streaming message. NaN when the
+   * message content is unavailable — adjacency cannot be proven, so the row
+   * renders solo.
    */
+  private liveBarrier(toolCallId: string, toolName: string): number {
+    const content = this.curMessage?.content;
+    if (!Array.isArray(content)) return NaN;
+    let found = false;
+    let barrier = 0;
+    for (const block of content) {
+      if (block?.type !== "toolCall") continue;
+      if (block.id === toolCallId) {
+        found = true;
+        break;
+      }
+      if (block.name !== toolName) barrier++;
+    }
+    if (!found) return NaN;
+    for (const names of this.segMsgNames)
+      for (const name of names)
+        if (name !== toolName) barrier++;
+    return barrier;
+  }
+
   /** Create or update an entry and remember its invalidation hook. */
   private upsert(
     toolCallId: string,
@@ -158,6 +309,9 @@ export class BurstTracker {
         seg: this.replaying
           ? (this.replaySegs.get(toolCallId) ?? NaN)
           : this.liveSeg,
+        barrier: this.replaying
+          ? (this.replayBarriers.get(toolCallId) ?? NaN)
+          : this.liveBarrier(toolCallId, toolName),
         index: this.entries.length,
       };
       this.entries.push(entry);
@@ -204,6 +358,7 @@ export class BurstTracker {
         toolName,
         args,
         seg: NaN,
+        barrier: NaN,
         index: -1,
       };
       return { entry: pseudo, burst: [pseudo] };
@@ -231,10 +386,15 @@ export class BurstTracker {
   }
 
   /**
-   * Call from renderResult. Records the result and revalidates the runs
-   * touching this entry (an arriving result can split a burst or surface an
-   * error flag on the leader). The changed row itself is NOT invalidated:
-   * pi is already re-rendering it.
+   * Call from renderResult. Records the result and revalidates the run's
+   * leader (an arriving result surfaces pending/error state on the leader's
+   * aggregated box). The changed row itself is NOT invalidated here — except
+   * when it IS the leader: pi's updateDisplay invokes renderCall before
+   * renderResult, so the box the leader just drew still shows the pre-result
+   * state, and a single-call burst has no neighbors to refresh it (its
+   * pending background would never clear). The contentRef guard turns the
+   * synchronous re-entry (invalidate -> updateDisplay -> renderResult) into
+   * a no-op, so this cannot churn.
    */
   recordResult(
     toolCallId: string | undefined,
@@ -247,19 +407,9 @@ export class BurstTracker {
     entry.contentRef = result?.content;
     entry.result = result;
     entry.isError = isError;
-    const idx = entry.index;
-    const ranges: Array<[number, number]> = [];
-    if (idx > 0) ranges.push(this.runAround(idx - 1));
-    if (idx + 1 < this.entries.length) ranges.push(this.runAround(idx + 1));
-    const seen = new Set<number>();
-    for (const [s, e] of ranges) {
-      for (let i = s; i <= e; i++) {
-        if (seen.has(i)) continue;
-        seen.add(i);
-        const fn = this.invalidates.get(this.entries[i].toolCallId);
-        if (fn) fn();
-      }
-    }
+    const [leaderIdx] = this.runAround(entry.index);
+    const fn = this.invalidates.get(this.entries[leaderIdx].toolCallId);
+    if (fn) fn();
   }
 
   /** Maximal groupable run containing entries[i] (pairwise adjacency). */
@@ -317,12 +467,14 @@ export function burstDetailBlock(
   theme: BurstTheme,
   label: string,
   text: string,
-  maxLines = 12,
+  opts: { maxLines?: number; error?: boolean } = {},
 ): string {
+  const maxLines = opts.maxLines ?? 12;
+  const color = opts.error ? "error" : "toolOutput";
   const lines = text.split("\n");
   const preview = lines
     .slice(0, maxLines)
-    .map((l) => theme.fg("toolOutput", l))
+    .map((l) => theme.fg(color, l))
     .join("\n");
   let block = `\n${theme.fg("muted", `— ${label}`)}:\n${preview}`;
   const remaining = lines.length - maxLines;

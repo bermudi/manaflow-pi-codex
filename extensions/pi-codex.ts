@@ -320,6 +320,16 @@ function webSearchBullet(entry: any, theme: BurstTheme): string {
   return burstBullet(theme, webSearchLabel(entry.args ?? {}), entry.isError);
 }
 
+/** Text content of a tool result — the only diagnostic thrown errors carry. */
+function resultText(result: {
+  content?: Array<{ type: string; text?: string }>;
+}): string {
+  return (result?.content ?? [])
+    .filter((c) => c.type === "text" && typeof c.text === "string")
+    .map((c) => c.text as string)
+    .join("\n");
+}
+
 // ── Default (standalone) rendering — used when clean-tui is not active ──
 // Mirrors pi's native edit rows: the call shows the title and touched paths,
 // and the result (colored diff / search output) stays visible. State comes
@@ -670,13 +680,25 @@ export default function piCodex(pi: ExtensionAPI) {
         const blocks: string[] = [];
         for (const e of burst) {
           const label = webSearchLabel(e.args ?? {});
-          const raw = (e.result?.details as WebSearchDetails | undefined)?.rawOutput;
-          if (!raw) {
+          if (!e.result) {
             if (burst.length > 1)
               blocks.push(theme.fg("warning", `— ${label}: pending`));
             continue;
           }
-          blocks.push(burstDetailBlock(theme, label, raw));
+          const raw = (e.result.details as WebSearchDetails | undefined)
+            ?.rawOutput;
+          if (raw) {
+            blocks.push(burstDetailBlock(theme, label, raw));
+            continue;
+          }
+          // Completed without rawOutput: a failed search (thrown error).
+          // The result text is the only diagnostic — surface it instead of
+          // an endless "pending".
+          blocks.push(
+            burstDetailBlock(theme, label, resultText(e.result) || "(no output)", {
+              error: !!e.isError,
+            }),
+          );
         }
         if (blocks.length) header += `\n${blocks.join("\n")}`;
       }
@@ -802,19 +824,31 @@ export default function piCodex(pi: ExtensionAPI) {
         const blocks: string[] = [];
         for (const e of burst) {
           const label = applyPatchLabel(e.args?.patch ?? "");
-          const diffs = (e.result?.details as ApplyPatchDetails | undefined)?.diffs ?? [];
-          if (!diffs.length) {
+          if (!e.result) {
             if (burst.length > 1)
               blocks.push(theme.fg("warning", `— ${label}: pending`));
             continue;
           }
-          const body = diffs
-            .map(
-              ({ path, diff }) =>
-                `${theme.fg("muted", path)}\n${renderDiff(diff, { filePath: path })}`,
-            )
-            .join("\n\n");
-          blocks.push(`\n${theme.fg("muted", `— ${label}`)}:\n${body}`);
+          const diffs = (e.result.details as ApplyPatchDetails | undefined)
+            ?.diffs ?? [];
+          if (diffs.length) {
+            const body = diffs
+              .map(
+                ({ path, diff }) =>
+                  `${theme.fg("muted", path)}\n${renderDiff(diff, { filePath: path })}`,
+              )
+              .join("\n\n");
+            blocks.push(`\n${theme.fg("muted", `— ${label}`)}:\n${body}`);
+            continue;
+          }
+          // Completed without diffs: a failed patch (thrown error) or a
+          // no-op. The result text is the only diagnostic — surface it
+          // instead of an endless "pending".
+          blocks.push(
+            burstDetailBlock(theme, label, resultText(e.result) || "(no output)", {
+              error: !!e.isError,
+            }),
+          );
         }
         if (blocks.length) header += `\n${blocks.join("\n")}`;
       }

@@ -1250,3 +1250,110 @@ test("official Codex binary applies add and update hunks", async () => {
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("burst rows surface failure diagnostics instead of a pending label", () => {
+  const PATCH =
+    "*** Begin Patch\n*** Add File: x.ts\n+x\n*** End Patch";
+  const tools = new Map<string, any>();
+  const handlers = new Map<string, Array<(...args: any[]) => unknown>>();
+  const pi = {
+    registerCommand() {},
+    registerTool(definition: any) {
+      tools.set(definition.name, definition);
+    },
+    getActiveTools: () => ["apply_patch", "web_search"],
+    getAllTools: () => [...tools.values()],
+    setActiveTools() {},
+    on(name: string, handler: (...args: any[]) => unknown) {
+      const list = handlers.get(name) ?? [];
+      list.push(handler);
+      handlers.set(name, list);
+    },
+  } as unknown as ExtensionAPI;
+  piCodex(pi);
+  const emit = (name: string, event?: any, ctx?: any) => {
+    for (const handler of handlers.get(name) ?? []) handler(event, ctx);
+  };
+  const applyPatch = tools.get("apply_patch");
+  const webSearch = tools.get("web_search");
+  assert.ok(applyPatch && webSearch);
+
+  emit("session_start", {}, {
+    sessionManager: { getBranch: () => [] },
+    hasUI: false,
+  });
+  emit("agent_start", {}, { hasUI: false });
+  emit("message_start", {
+    message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "p1", name: "apply_patch" },
+        { type: "toolCall", id: "p2", name: "apply_patch" },
+      ],
+    },
+  });
+
+  withCleanTui(() => {
+    const theme = renderTheme();
+    const ctx1 = renderCtx("p1");
+    const ctx2 = renderCtx("p2");
+    const leader = applyPatch.renderCall({ patch: PATCH }, theme, ctx1);
+    // p2 groups into p1's burst: its own row renders nothing.
+    const follower = applyPatch.renderCall({ patch: PATCH }, theme, ctx2);
+    assert.equal(follower.render(120).join("\n"), "");
+
+    // Both patches fail (thrown errors carry text, not diff details).
+    const errorResult = {
+      content: [{
+        type: "text",
+        text: "Codex apply_patch exited with status 1: context mismatch",
+      }],
+    };
+    applyPatch.renderResult(
+      errorResult,
+      { expanded: false, isPartial: false },
+      theme,
+      { ...ctx1, isError: true },
+    );
+    applyPatch.renderResult(
+      errorResult,
+      { expanded: false, isPartial: false },
+      theme,
+      { ...ctx2, isError: true },
+    );
+    ctx1.expanded = true;
+    const expanded = applyPatch.renderCall({ patch: PATCH }, theme, ctx1);
+    const expandedText = stripVTControlCharacters(expanded.render(120).join("\n"));
+    assert.match(expandedText, /exited with status 1: context mismatch/);
+    assert.doesNotMatch(expandedText, /pending/);
+    assert.match(stripVTControlCharacters(leader.render(120).join("\n")), /apply_patch x\.ts/);
+  });
+
+  // A solo failed web_search shows its error text when expanded.
+  emit("message_start", {
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "w1", name: "web_search" }],
+    },
+  });
+  withCleanTui(() => {
+    const theme = renderTheme();
+    const ctx = renderCtx("w1");
+    webSearch.renderCall({ search_query: [{ q: "x" }] }, theme, ctx);
+    webSearch.renderResult(
+      { content: [{ type: "text", text: "web_search requires an openai-codex model" }] },
+      { expanded: false, isPartial: false },
+      theme,
+      { ...ctx, isError: true },
+    );
+    ctx.expanded = true;
+    const expanded = webSearch.renderCall(
+      { search_query: [{ q: "x" }] },
+      theme,
+      ctx,
+    );
+    const expandedText = stripVTControlCharacters(expanded.render(120).join("\n"));
+    assert.match(expandedText, /web_search requires an openai-codex model/);
+    assert.doesNotMatch(expandedText, /pending/);
+  });
+});
