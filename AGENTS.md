@@ -44,6 +44,21 @@ Before shipping a resolution change, verify all three runtimes:
   `HOME=<fake> pi --mode rpc --no-session --no-skills --no-context-files
   --offline <<< '{"id":"state","type":"get_state"}'` → expect success.
 
+## Release
+
+Releasing is a **tag push**, not a local `npm publish`:
+
+1. `npm version <patch|minor> --no-git-tag-version`, commit as `0.1.<N>`, tag `v0.1.<N>`, push both.
+2. `.github/workflows/publish-manaflow-pi-codex.yml` fires on `v*` tags:
+   verifies tag ↔ package version, runs check + tests, then publishes via
+   npm trusted publishing (OIDC, `environment: npm-publish`) with provenance.
+3. There is deliberately no npm token on this machine — a local
+   `npm publish` fails with 404. That is expected, not a blocker. Check the
+   result with `gh run list --workflow publish-manaflow-pi-codex.yml`.
+4. Scoped-package tarball URLs drop the scope:
+   `@bermudi/pi-codex` → `.../-/pi-codex-<version>.tgz` (not
+   `bermudi-pi-codex-<version>.tgz`).
+
 ## Conventions
 
 - Node ≥ 22.19, ESM, TypeScript strict (`npm run check`).
