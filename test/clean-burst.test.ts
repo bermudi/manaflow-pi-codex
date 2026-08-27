@@ -299,7 +299,7 @@ test("a follower render refreshes the leader once and renders nothing itself", (
   assert.equal(leaderInvalidations, 1);
 });
 
-test("a single-call burst refreshes its own box when the result arrives", () => {
+test("a single-call burst refreshes its own box when the result arrives", async () => {
   const pi = fakePi();
   const tracker = new BurstTracker();
   tracker.registerHandlers(pi);
@@ -311,11 +311,14 @@ test("a single-call burst refreshes its own box when the result arrives", () => 
   assert.equal(invalidations, 0);
   // No neighbors exist to refresh the leader, so the leader (the entry
   // itself) must be invalidated or its pending background never clears.
+  // The invalidation is deferred past pi's in-flight render.
   tracker.recordResult(
     "a",
     { content: [{ type: "text", text: "ok" }] },
     false,
   );
+  assert.equal(invalidations, 0);
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(invalidations, 1);
 });
 

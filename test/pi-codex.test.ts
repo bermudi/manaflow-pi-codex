@@ -1357,3 +1357,57 @@ test("burst rows surface failure diagnostics instead of a pending label", () => 
     assert.doesNotMatch(expandedText, /pending/);
   });
 });
+
+test("standalone result rows render once while pi is mid-render", async () => {
+  const { ToolExecutionComponent } = await import(
+    "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js"
+  );
+  initTheme(undefined, false);
+
+  const tools = new Map<string, any>();
+  const pi = {
+    registerCommand() {},
+    registerTool(definition: any) {
+      tools.set(definition.name, definition);
+    },
+    getActiveTools: () => ["apply_patch"],
+    getAllTools: () => [...tools.values()],
+    setActiveTools() {},
+    on() {},
+  } as unknown as ExtensionAPI;
+  piCodex(pi);
+  const applyPatch = tools.get("apply_patch");
+  assert.ok(applyPatch);
+
+  const PATCH =
+    "*** Begin Patch\n*** Add File: x.ts\n+x\n*** End Patch";
+  // A real pi row: updateDisplay invokes renderCall before renderResult, so
+  // a synchronous self-invalidation inside recordResult used to re-enter the
+  // render and append the result a second time.
+  const component = new ToolExecutionComponent(
+    "apply_patch",
+    "standalone-once",
+    { patch: PATCH },
+    {},
+    applyPatch,
+    { requestRender() {} } as any,
+    process.cwd(),
+  );
+  component.updateResult(
+    {
+      content: [{ type: "text", text: "failed diagnostic" }],
+      isError: true,
+    },
+    false,
+  );
+
+  const occurrences = (lines: string[], needle: string) =>
+    stripVTControlCharacters(lines.join("\n")).split(needle).length - 1;
+  // Before the deferred invalidation fires: exactly one result.
+  assert.equal(occurrences(component.render(120), "failed diagnostic"), 1);
+  assert.equal(occurrences(component.render(120), "x.ts"), 1);
+  // After the deferred invalidation fires: still exactly one result.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(occurrences(component.render(120), "failed diagnostic"), 1);
+  assert.equal(occurrences(component.render(120), "x.ts"), 1);
+});
