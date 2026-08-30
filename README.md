@@ -103,6 +103,8 @@ Current OpenAI Codex enables `RemoteCompactionV2` by default. `pi-codex` mirrors
 6. Replays `x-codex-turn-state` only within the active Pi turn, including an
    immediate overflow retry.
 
+Automatic compaction runs between tool results and the next reply within the same agent run on pi ≥ 0.84.4, so long tool loops compact before the next model request instead of only after the run settles. Older pi versions check only after the run ends and can overshoot the window mid-loop.
+
 For every model under the `openai-codex` provider, `pi-codex` matches Codex's default automatic-compaction boundary at 90% of that model's context window. For example, the live 272,000-token models compact beginning at 244,800 tokens, while the 128,000-token Spark model begins at 115,200. Internally the pi reserve includes one extra token because pi's comparison is `>` while Codex's is `>=`. The override is in-memory, applies only while an `openai-codex` model is selected, preserves an explicit `compaction.enabled: false`, and does not rewrite `settings.json` or affect other providers.
 
 The older `/codex/responses/compact` endpoint remains in Codex for the legacy implementation, but it is not the default in the inspected upstream revision. There is no additional compaction-specific subrouter path: both normal and compaction V2 traffic use the resolved base URL's `/backend-api/codex/responses` route.
