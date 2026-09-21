@@ -116,6 +116,22 @@ function installCompactCompactionRenderer() {
     original.call(this);
     if ((this as any).expanded) return;
 
+    // pi >= 0.87 nests [label, Spacer, status] in a Container wrapped by a
+    // MouseRegion (click-to-expand); mutate that container so the region
+    // and its expand affordance survive.
+    const nested = ((this as any).children as Array<any>)[0]?.child as
+      | { children: Array<{ text?: string }>; clear: () => void; addChild: (c: unknown) => void }
+      | undefined;
+    if (nested && Array.isArray(nested.children)) {
+      const label = nested.children[0]?.text;
+      const status = nested.children.at(-1)?.text;
+      if (typeof label !== "string" || typeof status !== "string") return;
+      nested.clear();
+      nested.addChild(new Text(`${label} ${status}`, 0, 0));
+      return;
+    }
+
+    // pi <= 0.86 keeps label/status as direct children.
     const children = (this as any).children as Array<{ text?: string }>;
     const label = children[0]?.text;
     const status = children.at(-1)?.text;

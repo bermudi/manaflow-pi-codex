@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
-import type { Context, Model, Usage } from "@earendil-works/pi-ai";
+import type {
+  Context,
+  Model,
+  TranscriptContext,
+  Usage,
+} from "@earendil-works/pi-ai";
 import {
   convertToLlm,
   sessionEntryToContextMessages,
@@ -298,7 +303,16 @@ export function convertCompactionMessages(
   model: Model<any>,
   messages: CompactionMessages,
 ): ResponseItem[] {
-  const context: Context = { messages: convertToLlm(messages) };
+  // pi-ai 0.87 brands transcripts as TranscriptContext via normalizeContext(),
+  // which folds systemPrompt/tools into a leading system message. This call
+  // passes includeSystemPrompt:false and no tools, the exact case where
+  // normalizeContext is a runtime no-op ({ messages } in, { messages } out),
+  // so the brand is asserted instead of resolved through pi's own dist (which
+  // lacks utils/transcript.js on pi < 0.87). Revisit if pi-ai ever makes the
+  // fold meaningful here.
+  const context = {
+    messages: convertToLlm(messages),
+  } as TranscriptContext;
   const toolCallProviders = new Set(CODEX_TOOL_CALL_PROVIDERS);
   toolCallProviders.add(model.provider);
   for (const message of messages as readonly any[]) {
