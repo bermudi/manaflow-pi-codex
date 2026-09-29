@@ -68,6 +68,11 @@ Releasing is a **tag push**, not a local `npm publish`:
 4. Scoped-package tarball URLs drop the scope:
    `@bermudi/pi-codex` → `.../-/pi-codex-<version>.tgz` (not
    `bermudi-pi-codex-<version>.tgz`).
+5. **Only bermudi installs new versions.** Publishing ends the agent's job:
+   never run `pi update`, `pi install`, or otherwise modify the real managed
+   root (`~/.pi/agent/npm`). Report the published version and stop — he
+   installs when he chooses. The fake-HOME managed-root *simulation* in
+   Verification is unaffected.
 
 ## Conventions
 
