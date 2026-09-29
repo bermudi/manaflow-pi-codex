@@ -15,9 +15,15 @@ const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
  * `--legacy-peer-deps`, so peerDependencies are never on disk.
  *
  * Rules enforced here:
+ *   0. Host-provided packages (pi-ai, pi-coding-agent, pi-tui,
+ *      pi-agent-core, typebox, @sinclair/typebox) must be declared in
+ *      `peerDependencies` with a `"*"` range, never `dependencies` — pi
+ *      >= 0.87.1 warns on installed copies (they can bypass the extension
+ *      loader and create duplicate runtime modules).
  *   1. Runtime import specifiers must be a node builtin, a relative path, a
  *      sandbox-served id, or a package (or subpath) declared in
- *      `dependencies`.
+ *      `dependencies`. Code the sandbox does not serve must be vendored
+ *      (see scripts/vendor-pi-ai.mjs), not imported from an installed copy.
  *   2. Resolver calls (`import.meta.resolve` / `require.resolve`) bypass the
  *      sandbox module map, so their specifier must be a dependency subpath
  *      that the sandbox does NOT serve. Resolving a sandbox-served id is how
@@ -33,8 +39,8 @@ const NODE_BUILTINS = new Set([
 ]);
 
 // Ids pi's extension sandbox serves itself (see pi's extension loader
-// VIRTUAL_MODULES / alias table). Anything else from these packages must
-// come from our own node_modules — i.e., be declared in dependencies.
+// VIRTUAL_MODULES / alias table). Anything else from these packages must be
+// vendored (scripts/vendor-pi-ai.mjs), not imported from an installed copy.
 const SANDBOXED_IDS = new Set([
   "@earendil-works/pi-ai",
   "@earendil-works/pi-ai/compat",
@@ -64,6 +70,20 @@ const IMPORT_PATTERNS = [
   /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
   /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,
 ];
+
+// Mirrors pi's resource-loader HOST_PROVIDED_EXTENSION_PACKAGES (>= 0.87.1).
+const HOST_PROVIDED_PACKAGES = new Set([
+  "@earendil-works/pi-agent-core",
+  "@earendil-works/pi-ai",
+  "@earendil-works/pi-coding-agent",
+  "@earendil-works/pi-tui",
+  "@mariozechner/pi-agent-core",
+  "@mariozechner/pi-ai",
+  "@mariozechner/pi-coding-agent",
+  "@mariozechner/pi-tui",
+  "@sinclair/typebox",
+  "typebox",
+]);
 
 const RESOLVE_PATTERNS = [
   /\bimport\.meta\.resolve\s*\(\s*["']([^"']+)["']/g,
@@ -103,6 +123,55 @@ function isSandboxed(specifier: string): boolean {
 function isDependency(specifier: string, prodDeps: Set<string>): boolean {
   return prodDeps.has(packageName(specifier));
 }
+
+test("host-provided packages stay out of dependencies", () => {
+  const manifest = JSON.parse(
+    readFileSync(join(packageRoot, "package.json"), "utf8"),
+  );
+  const violations: string[] = [];
+  for (const name of Object.keys(manifest.dependencies ?? {})) {
+    if (HOST_PROVIDED_PACKAGES.has(name)) {
+      violations.push(
+        `dependencies."${name}" — declare it in peerDependencies with a "*" range instead`,
+      );
+    }
+  }
+  for (const name of Object.keys(manifest.peerDependencies ?? {})) {
+    if (HOST_PROVIDED_PACKAGES.has(name) && manifest.peerDependencies[name] !== "*") {
+      violations.push(
+        `peerDependencies."${name}" must use the "*" range (got "${manifest.peerDependencies[name]}")`,
+      );
+    }
+  }
+  assert.deepStrictEqual(
+    violations,
+    [],
+    [
+      "Host-provided extension packages must not ship installed copies.",
+      ...violations,
+    ].join("\n"),
+  );
+});
+
+test("vendored pi-ai converter is present and stamped", () => {
+  const vendorFile = join(
+    packageRoot,
+    "src/vendor/openai-responses-shared.mjs",
+  );
+  const source = readFileSync(vendorFile, "utf8");
+  assert.match(
+    source,
+    /^\/\/ GENERATED FILE[\s\S]*?Vendored from @earendil-works\/pi-ai@\d+\.\d+\.\d+[\s\S]*?Regenerate with: npm run vendor/,
+    "vendor file is missing its generator banner — regenerate with npm run vendor",
+  );
+  for (const name of ["convertResponsesMessages", "convertResponsesTools"]) {
+    assert.match(
+      source,
+      new RegExp(`\\b${name}\\b`),
+      `vendor file does not export ${name}`,
+    );
+  }
+});
 
 test("shipped code imports stay within pi's extension contract", () => {
   const manifest = JSON.parse(

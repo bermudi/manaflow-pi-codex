@@ -20,44 +20,20 @@ import {
 type CompactionMessages = SessionBeforeCompactEvent["preparation"]["messagesToSummarize"];
 
 // The Responses converters live on pi-ai's public `./api/*` subpath, which
-// pi's extension sandbox does not serve: bundled pi maps only the package
-// root (compat), `/oauth`, and `/providers/all` onto its bundled modules,
-// and unbundled pi's jiti aliases prefix-rewrite `@earendil-works/pi-ai*`
-// imports onto `dist/compat.js`, corrupting subpaths. Pi's installer also
-// runs npm with `--legacy-peer-deps`, so peers are never on disk — which is
-// why resolving the package root alone (0.1.5's mistake) hard-failed in
-// npm installs.
-//
-// The package therefore declares `@earendil-works/pi-ai` as a regular
-// dependency. Resolving the package ROOT via native `import.meta.resolve`
-// and composing the subpath relative to the resolved entry file yields a
-// real `dist/` file URL in every distribution:
-//   - bundled pi (virtualModules): jiti falls back to the native resolver,
-//     which finds our on-disk dependency entry (`dist/index.js`);
-//   - unbundled pi (jiti aliases): the root id alias-maps to `dist/compat.js`
-//     in pi's own dependency tree — same `dist/` directory;
-//   - plain node (tests): our dependency entry.
-// The subsequent dynamic import of the concrete file URL bypasses jiti's
-// rewrites. The subpath's dist layout is pinned by the dependency range.
-// The converter consumes plain data (no instanceof checks), so sharing
-// values with the sandboxed pi-ai instance is safe. The type-only import
-// keeps call sites checked.
-import type {
-  convertResponsesMessages as convertResponsesMessagesType,
-  convertResponsesTools as convertResponsesToolsType,
-} from "@earendil-works/pi-ai/api/openai-responses-shared";
-
-const piAiEntryUrl = import.meta.resolve("@earendil-works/pi-ai");
-const sharedResponsesUrl = new URL(
-  "./api/openai-responses-shared.js",
-  piAiEntryUrl,
-).href;
-const { convertResponsesMessages, convertResponsesTools } = (await import(
-  sharedResponsesUrl
-)) as {
-  convertResponsesMessages: typeof convertResponsesMessagesType;
-  convertResponsesTools: typeof convertResponsesToolsType;
-};
+// pi's extension sandbox does not serve: it maps only the package root
+// (compat), `/oauth`, and `/providers/all` onto its bundled modules. Pi's
+// installer also runs npm with `--legacy-peer-deps` (peers are never on
+// disk), and pi >= 0.87.1 warns when host-provided packages like pi-ai are
+// declared as regular dependencies. The module is therefore vendored into
+// this package: regenerate with `npm run vendor` whenever the pi-ai peer
+// range moves. The converter consumes plain data (no instanceof checks), so
+// running it as a private copy alongside pi's sandboxed pi-ai is safe.
+// test/vendor-parity.test.ts fails when the vendored copy drifts from the
+// installed pi-ai.
+import {
+  convertResponsesMessages,
+  convertResponsesTools,
+} from "./vendor/openai-responses-shared.mjs";
 
 export const REMOTE_COMPACTION_KIND = "pi-codex-remote-compaction";
 export const REMOTE_COMPACTION_VERSION = 2;

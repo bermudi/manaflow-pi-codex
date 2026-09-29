@@ -22,14 +22,9 @@ const packageRoot = join(import.meta.dirname, "..");
  */
 
 const ALLOWED_SCRIPT_PACKAGES = new Map([
-  [
-    "@google/genai",
-    "preinstall is `echo 'preinstall: no-op'` (verified in installed tarball)",
-  ],
-  [
-    "protobufjs",
-    "postinstall only prints a version-scheme warning; no-op without versionScheme (verified in installed tarball)",
-  ],
+  // Empty since pi-ai (the only prod dep with scripted transitive deps:
+  // @google/genai, protobufjs) moved to a peer — peers are outside the prod
+  // tree. Re-add entries here when a new dependency ships install scripts.
 ]);
 
 type LockPackage = {

@@ -1,5 +1,17 @@
 # Third-party notices
 
+## Vendored pi-ai Responses converter (`src/vendor/openai-responses-shared.mjs`)
+
+This generated file bundles code from:
+
+- Project: pi-ai (`@earendil-works/pi-ai`, `dist/api/openai-responses-shared.js` and its dependency closure)
+- License: MIT
+- Repository: https://github.com/earendil-works/pi (packages/ai)
+
+including `partial-json` 0.1.7 (MIT, https://github.com/promplate/partial-json) inlined from pi-ai's dependency closure.
+
+Regenerate with `npm run vendor`; do not edit by hand.
+
 ## OpenAI Codex
 
 This package includes `src/apply-patch.lark`, copied from:
