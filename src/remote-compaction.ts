@@ -42,6 +42,41 @@ export const SERVER_COMPACTION_KIND = "pi-codex-server-compaction";
 export const SERVER_COMPACTION_VERSION = 1;
 export const OPENAI_RESPONSES_BASE_URL = "https://api.openai.com/v1";
 export const MIN_SERVER_COMPACTION_THRESHOLD = 1_000;
+/**
+ * Server compaction consumes `provider_stream_event` and commits through
+ * `turn_end` boundary drafts; both arrived in pi 0.99.0. Older builds accept
+ * the event registration silently but never emit it, so requesting
+ * `context_management` there would suppress local compaction without ever
+ * persisting a checkpoint.
+ */
+export const MIN_SERVER_COMPACTION_PI_VERSION = "0.99.0";
+
+function parseVersion(version: string): [number, number, number] | undefined {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
+  if (!match) return undefined;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/** Numeric major.minor.patch comparison; pre-release suffixes keep their base release. */
+export function piVersionAtLeast(version: string, minimum: string): boolean {
+  const actual = parseVersion(version);
+  const required = parseVersion(minimum);
+  if (!actual || !required) return false;
+  for (let index = 0; index < 3; index++) {
+    if (actual[index] !== required[index]) return actual[index] > required[index];
+  }
+  return true;
+}
+
+/**
+ * True when the host pi build has every event the server compaction path
+ * needs. An unparsable version is treated as unsupported: guessing "supported"
+ * silently breaks compaction, while guessing "unsupported" only keeps the
+ * local path.
+ */
+export function piSupportsServerCompaction(version: string): boolean {
+  return piVersionAtLeast(version, MIN_SERVER_COMPACTION_PI_VERSION);
+}
 const SERVER_COMPACTION_THRESHOLD_FRACTION = 0.9;
 const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);

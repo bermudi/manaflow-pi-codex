@@ -10,6 +10,7 @@ import {
   generateDiffString,
   renderDiff,
   SettingsManager,
+  VERSION as PI_VERSION,
   type ToolDefinition,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
@@ -35,7 +36,9 @@ import {
   isRemoteCompactionDetails,
   isServerCompactionCandidate,
   isServerCompactionDetails,
+  MIN_SERVER_COMPACTION_PI_VERSION,
   parseRemoteCompactionSse,
+  piSupportsServerCompaction,
   prependServerCompactionCheckpoint,
   retainedContextItems,
   REMOTE_COMPACTION_VERSION,
@@ -112,7 +115,7 @@ let activeCodexContextWindow: number | undefined;
 // summarization (manual /compact and overflow fallback), which still needs a
 // usable output budget.
 let activeServerCompactionKey: string | undefined;
-let serverCompactionAppendAvailable = true;
+let serverCompactionAppendAvailable = piSupportsServerCompaction(PI_VERSION);
 let configuredServerCompactionReserveTokens = DEFAULT_LOCAL_COMPACTION_RESERVE_TOKENS;
 let serverCompactionAppendWarningEmitted = false;
 
@@ -214,8 +217,8 @@ function formatWorkingElapsed(elapsedMs: number): string {
 
 /**
  * Track which connection owns compaction thresholds for the selected model.
- * The optional base URL is the provider-auth override; callers that only have
- * the model fall back to `model.baseUrl`.
+ * The base URL is the provider-auth override; callers resolve it first so a
+ * stale default URL never enables server compaction on a proxied connection.
  */
 function updateServerCompactionState(
   model: Model<any> | undefined,
@@ -651,8 +654,9 @@ export default function piCodex(pi: ExtensionAPI) {
    * - Latest boundary is the server compaction: replace its marker.
    * - Latest boundary is a local compaction: the server checkpoint is older
    *   but still owns the prefix that the local summary cannot see. Prepend it.
-   * - Latest boundary is a branch summary: the branch has moved past the
-   *   checkpoint, so leave the request alone.
+   * - Branch summaries are additive context on the active path, not
+   *   replacement boundaries: `branchWithSummary()` leaves the checkpoint that
+   *   precedes the branch point on the path, so keep scanning past them.
    */
   function serverCompactionInstallPlan(ctx: {
     sessionManager: { getBranch(): readonly any[] };
@@ -660,14 +664,12 @@ export default function piCodex(pi: ExtensionAPI) {
     const branch = ctx.sessionManager.getBranch();
     for (let index = branch.length - 1; index >= 0; index--) {
       const entry = branch[index] as any;
-      if (entry?.type === "branch_summary") return undefined;
       if (entry?.type !== "compaction") continue;
       if (isServerCompactionDetails(entry.details)) {
         return { mode: "replace", details: entry.details };
       }
       for (let older = index - 1; older >= 0; older--) {
         const candidate = branch[older] as any;
-        if (candidate?.type === "branch_summary") return undefined;
         if (
           candidate?.type === "compaction" &&
           isServerCompactionDetails(candidate.details)
@@ -720,11 +722,19 @@ export default function piCodex(pi: ExtensionAPI) {
     // serve. Session start and model switch must not trigger auth refreshes for
     // unrelated providers.
     if (!model || !isServerCompactionCandidate(model)) {
-      updateServerCompactionState(undefined);
+      clearServerCompactionState();
       return;
     }
-    const providerBaseUrl = await resolveProviderBaseUrl(ctx, model);
-    updateServerCompactionState(model, providerBaseUrl);
+    try {
+      const providerBaseUrl = await resolveProviderBaseUrl(ctx, model);
+      updateServerCompactionState(model, providerBaseUrl);
+    } catch (error) {
+      // A failed lookup means the effective connection is unknown. Leaving the
+      // previous model's server state active would keep pi's local compaction
+      // threshold suppressed without a server checkpoint path.
+      clearServerCompactionState();
+      throw error;
+    }
   }
 
   function serverCompactionEnabled(): boolean {
@@ -740,11 +750,19 @@ export default function piCodex(pi: ExtensionAPI) {
   }
 
   function supportsServerCompactionAppend(ctx: any): boolean {
-    if (hasServerCompactionAppend(ctx)) return true;
+    const hostSupported = piSupportsServerCompaction(PI_VERSION);
+    const appendSupported = hasServerCompactionAppend(ctx);
+    if (hostSupported && appendSupported) return true;
     if (!serverCompactionAppendWarningEmitted) {
       serverCompactionAppendWarningEmitted = true;
+      const missing = [
+        hostSupported
+          ? undefined
+          : `provider_stream_event and turn_end boundary drafts (pi ${PI_VERSION})`,
+        appendSupported ? undefined : "SessionManager.appendCompaction",
+      ].filter((value): value is string => value !== undefined);
       process.stderr.write(
-        "[pi-codex] server-side compaction disabled: this pi build has no SessionManager.appendCompaction (requires pi >= 1.3.0)\n",
+        `[pi-codex] server-side compaction disabled: this pi build is missing ${missing.join(" and ")} (requires pi >= ${MIN_SERVER_COMPACTION_PI_VERSION})\n`,
       );
     }
     return false;
@@ -752,11 +770,18 @@ export default function piCodex(pi: ExtensionAPI) {
 
   let serverCompactionCapture: ServerCompactionCapture | undefined;
 
+  function clearServerCompactionState() {
+    serverCompactionCapture = undefined;
+    updateServerCompactionState(undefined);
+  }
+
   function syncTools(model: Model<any> | undefined) {
     activeCodexContextWindow = isOpenAICodexModel(model)
       ? model?.contextWindow
       : undefined;
-    updateServerCompactionState(model);
+    // Callers refresh server compaction state with the resolved provider base
+    // URL. Setting it here from model.baseUrl could enable the server path on a
+    // proxied connection, then leave it active when the auth lookup fails.
     const active = new Set(pi.getActiveTools());
     applyPatchSelected ??= active.has("apply_patch");
     webSearchSelected ??= active.has("web_search");
@@ -1357,46 +1382,52 @@ export default function piCodex(pi: ExtensionAPI) {
     if (!isServerCompactionCandidate(model)) {
       // Opted out at the model level; make sure a previously active server
       // connection cannot keep suppressing local compaction.
-      serverCompactionCapture = undefined;
-      updateServerCompactionState(undefined);
-      return;
-    }
-    const providerBaseUrl = await resolveProviderBaseUrl(ctx, model);
-    if (!isOpenAIServerCompactionModel(model, providerBaseUrl)) {
-      // The same model can be repointed at a proxy via provider auth. Drop the
-      // server threshold/capture state so the local path is restored. The
-      // checkpoint repair above already ran, so an existing session keeps its
-      // pre-checkpoint context on the proxied connection.
-      serverCompactionCapture = undefined;
-      updateServerCompactionState(undefined);
+      clearServerCompactionState();
       return;
     }
 
-    if (!supportsServerCompactionAppend(ctx)) {
-      // Older pi cannot persist the opaque item, so leave local compaction
-      // (including its threshold override) untouched.
-      serverCompactionAppendAvailable = false;
+    try {
+      const providerBaseUrl = await resolveProviderBaseUrl(ctx, model);
+      if (!isOpenAIServerCompactionModel(model, providerBaseUrl)) {
+        // The same model can be repointed at a proxy via provider auth. Drop
+        // the server threshold/capture state so the local path is restored.
+        // The checkpoint repair above already ran, so an existing session
+        // keeps its pre-checkpoint context on the proxied connection.
+        clearServerCompactionState();
+        return;
+      }
+
+      if (!supportsServerCompactionAppend(ctx)) {
+        // Older pi cannot observe or persist the opaque item, so leave local
+        // compaction (including its threshold override) untouched.
+        serverCompactionAppendAvailable = false;
+        clearServerCompactionState();
+        return;
+      }
+
+      // Read the settings before touching any state: a failed read must not
+      // leave the local threshold suppressed while server compaction is
+      // inactive. The throw propagates (runner logs it); the payload keeps the
+      // repaired checkpoint but no context_management.
+      const compactionEnabled = serverCompactionEnabled();
+
+      // Each provider request owns a fresh capture slot, including retries.
       serverCompactionCapture = undefined;
-      updateServerCompactionState(undefined);
-      return;
+      serverCompactionAppendAvailable = true;
+      updateServerCompactionState(model, providerBaseUrl);
+
+      installServerCompactionContextManagement(
+        event.payload,
+        model.contextWindow,
+        compactionEnabled,
+      );
+    } catch (error) {
+      // An aborted preparation must not leave the reserve suppressed: without
+      // context_management on the wire, the server can never produce the
+      // checkpoint that would justify it.
+      clearServerCompactionState();
+      throw error;
     }
-
-    // Read the settings before touching any state: a failed read must not
-    // leave the local threshold suppressed while server compaction is
-    // inactive. The throw propagates (runner logs it); the payload keeps the
-    // repaired checkpoint but no context_management.
-    const compactionEnabled = serverCompactionEnabled();
-
-    // Each provider request owns a fresh capture slot, including retries.
-    serverCompactionCapture = undefined;
-    serverCompactionAppendAvailable = true;
-    updateServerCompactionState(model, providerBaseUrl);
-
-    installServerCompactionContextManagement(
-      event.payload,
-      model.contextWindow,
-      compactionEnabled,
-    );
   });
 
   pi.on("provider_stream_event", (event) => {
@@ -1477,42 +1508,11 @@ export default function piCodex(pi: ExtensionAPI) {
         replacement: retained.length > 0 ? { content: retained } : null,
       });
 
-      // A tool call before the boundary is folded into the checkpoint, but its
-      // toolResult lives in a separate entry after the assistant message.
-      // Pi does not prune orphans, and the Responses converter emits
-      // function_call_output unconditionally, so a kept result would replay as
-      // an output with no matching call — which the Responses API rejects.
-      // Omit those tool-result entries from model context; results of calls at
-      // or after the boundary are untouched.
-      const droppedCallIds = new Set(
-        content
-          .slice(0, splitAt)
-          .flatMap((block: any) =>
-            block?.type === "toolCall" && typeof block.id === "string"
-              ? [block.id as string]
-              : [],
-          ),
-      );
-      if (droppedCallIds.size > 0) {
-        const toolResultEntryIds: string[] = event.toolResultEntryIds ?? [];
-        if (toolResultEntryIds.length !== event.toolResults.length) {
-          // Drafts are applied only when this handler returns normally: the
-          // checkpoint is lost, but the session keeps its full history and
-          // server compaction simply runs again. Committing with unknown
-          // orphan entry ids would corrupt the next request instead.
-          throw new Error(
-            `pi-codex: turn_end toolResultEntryIds (${toolResultEntryIds.length}) do not match toolResults (${event.toolResults.length}); refusing to commit a server checkpoint with orphaned tool results`,
-          );
-        }
-        event.toolResults.forEach((result: any, index: number) => {
-          if (!droppedCallIds.has(result.toolCallId)) return;
-          entries.push({
-            type: "context_edit",
-            targetId: toolResultEntryIds[index],
-            replacement: null,
-          });
-        });
-      }
+      // Tool results are deliberately left alone, including results whose
+      // calls the checkpoint absorbed. The server retains those calls inside
+      // the opaque item, so a following function_call_output is replay-valid;
+      // only items *before* the newest compaction may be pruned. Dropping the
+      // result would discard conversation content the checkpoint never saw.
     }
 
     const piUsage = tokenUsage ? toPiUsage(tokenUsage) : undefined;
@@ -1534,8 +1534,9 @@ export default function piCodex(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     retryTurnState = undefined;
     turnState = undefined;
-    serverCompactionCapture = undefined;
-    serverCompactionAppendAvailable = hasServerCompactionAppend(ctx);
+    clearServerCompactionState();
+    serverCompactionAppendAvailable =
+      piSupportsServerCompaction(PI_VERSION) && hasServerCompactionAppend(ctx);
     serverCompactionCheckpointWarnings.clear();
     restoreFastMode(ctx);
     syncTools(ctx.model);
@@ -1549,8 +1550,7 @@ export default function piCodex(pi: ExtensionAPI) {
   });
   pi.on("session_shutdown", () => {
     stopWorkingTicker();
-    serverCompactionCapture = undefined;
-    updateServerCompactionState(undefined);
+    clearServerCompactionState();
   });
 }
 

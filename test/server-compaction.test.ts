@@ -16,6 +16,8 @@ import {
   isOpenAIServerCompactionModel,
   isServerCompactionCandidate,
   isServerCompactionDetails,
+  MIN_SERVER_COMPACTION_PI_VERSION,
+  piSupportsServerCompaction,
   prependServerCompactionCheckpoint,
   SERVER_COMPACTION_KIND,
   SERVER_COMPACTION_VERSION,
@@ -184,6 +186,22 @@ test("server compaction predicate identifies the first-party openai Responses co
     isServerCompactionCandidate(serverModel({ compat: { supportsServerCompaction: false } })),
     false,
   );
+});
+
+test("server compaction requires the pi 0.99 stream events and turn_end drafts", () => {
+  assert.equal(MIN_SERVER_COMPACTION_PI_VERSION, "0.99.0");
+  // provider_stream_event does not exist in 0.87 and first appears in 0.99.
+  assert.equal(piSupportsServerCompaction("0.87.0"), false);
+  assert.equal(piSupportsServerCompaction("0.98.9"), false);
+  assert.equal(piSupportsServerCompaction("0.99.0"), true);
+  assert.equal(piSupportsServerCompaction("0.99.0-beta.2"), true);
+  assert.equal(piSupportsServerCompaction("1.3.0"), true);
+  assert.equal(piSupportsServerCompaction("2.0.0"), true);
+  // The gate fails closed: an unparsable host version must not suppress local
+  // compaction on the assumption that the event exists.
+  assert.equal(piSupportsServerCompaction("unknown"), false);
+  assert.equal(piSupportsServerCompaction("0.99"), false);
+  assert.equal(piSupportsServerCompaction(""), false);
 });
 
 test("server compaction defaults to the probed gpt-6 family and needs an opt-in elsewhere", () => {
@@ -370,11 +388,11 @@ test("server checkpoint replacement works through pi's compaction projection", a
   assert.doesNotMatch(JSON.stringify(payload.input), /before the checkpoint/);
 });
 
-test("a committed server checkpoint drops orphaned tool results from the next request", async () => {
+test("a committed server checkpoint keeps tool results whose calls it absorbed", async () => {
   const { convertResponsesMessages } = await import(
     "../src/vendor/openai-responses-shared.mjs"
   );
-  const session = SessionManager.inMemory("/tmp/pi-codex-orphan-tool-result-test");
+  const session = SessionManager.inMemory("/tmp/pi-codex-absorbed-tool-result-test");
   const timestamp = Date.now();
   session.appendMessage({
     role: "user",
@@ -406,7 +424,7 @@ test("a committed server checkpoint drops orphaned tool results from the next re
     stopReason: "toolUse",
     timestamp: timestamp + 1,
   } as any);
-  const firstResultId = session.appendMessage({
+  session.appendMessage({
     role: "toolResult",
     toolCallId: "call_1|fc_1",
     toolName: "bash",
@@ -424,7 +442,7 @@ test("a committed server checkpoint drops orphaned tool results from the next re
   } as any);
 
   // The drafts turn_end returns for this capture: trim the pre-checkpoint
-  // assistant prefix and omit the dropped call's tool result.
+  // assistant prefix, but leave both tool-result entries in model context.
   session.appendContextEdit(assistantId, {
     content: [
       { type: "text", text: "after the checkpoint" },
@@ -436,34 +454,43 @@ test("a committed server checkpoint drops orphaned tool results from the next re
       },
     ],
   });
-  session.appendContextEdit(firstResultId, null);
   const item = { type: "compaction", id: "cmp_orphan", encrypted_content: "opaque" };
+  const details = detailsFor("cp-orphan", item);
   session.appendCompaction(
     serverCompactionMarker("cp-orphan"),
     assistantId,
     12_345,
-    detailsFor("cp-orphan", item),
+    details,
     true,
   );
 
   const projected = session.buildSessionProjection();
-  const input = (convertResponsesMessages as any)(
-    serverModel(),
-    { messages: convertToLlm(projected.messages) },
-    new Set(["openai"]),
-    { includeSystemPrompt: false, grammarToolInputProperties: new Map() },
-  ) as any[];
+  const payload: any = {
+    input: (convertResponsesMessages as any)(
+      serverModel(),
+      { messages: convertToLlm(projected.messages) },
+      new Set(["openai"]),
+      { includeSystemPrompt: false, grammarToolInputProperties: new Map() },
+    ),
+  };
+  installServerCompactionCheckpoint(payload, details);
 
-  // The next request pairs one function_call with one function_call_output:
-  // the pre-checkpoint call's result is gone with its call, which the
-  // Responses API would otherwise reject as an orphaned output.
-  const calls = input.filter((entry) => entry.type === "function_call");
-  const outputs = input.filter((entry) => entry.type === "function_call_output");
-  assert.deepEqual(calls.map((call) => call.call_id), ["call_2"]);
-  assert.deepEqual(outputs.map((output) => output.call_id), ["call_2"]);
-  assert.doesNotMatch(JSON.stringify(input), /call_1/);
-  assert.doesNotMatch(JSON.stringify(input), /before the checkpoint/);
-  assert.match(JSON.stringify(input[0]), /pi-codex server compaction cp-orphan/);
+  // Only items before the newest compaction may be pruned. call_1's
+  // function_call was absorbed into the checkpoint, but its output happened
+  // after it and the server retains the call inside the opaque item, so the
+  // pair is replay-valid. Dropping the output would lose real conversation
+  // content the checkpoint never saw.
+  assert.deepEqual(payload.input[0], item);
+  const calls = payload.input.filter((entry: any) => entry.type === "function_call");
+  const outputs = payload.input.filter(
+    (entry: any) => entry.type === "function_call_output",
+  );
+  assert.deepEqual(calls.map((call: any) => call.call_id), ["call_2"]);
+  assert.deepEqual(
+    outputs.map((output: any) => output.call_id),
+    ["call_1", "call_2"],
+  );
+  assert.doesNotMatch(JSON.stringify(payload.input), /before the checkpoint/);
 });
 
 test("an older server checkpoint survives a later local compaction", async () => {
@@ -742,25 +769,105 @@ test("request hook keeps an older checkpoint ahead of a later local summary", as
   ]);
 });
 
-test("a branch summary after the checkpoint stops reinstallation", async () => {
+test("a branch summary after the checkpoint still installs the checkpoint", async () => {
   const { handlers } = createHarness();
-  const item = { type: "compaction", id: "cmp_old", encrypted_content: "opaque" };
-  const details = detailsFor("cp-old", item);
+  const session = SessionManager.inMemory("/tmp/pi-codex-branch-summary");
+  const userId = session.appendMessage({
+    role: "user",
+    content: [{ type: "text", text: "start" }],
+    timestamp: Date.now(),
+  } as any);
+  const item = { type: "compaction", id: "cmp_branch", encrypted_content: "opaque" };
+  const details = detailsFor("cp-branch", item);
+  session.appendCompaction(
+    serverCompactionMarker("cp-branch"),
+    userId,
+    12_345,
+    details,
+    true,
+  );
+  const assistantId = session.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "after the checkpoint" }],
+    api: "openai-responses",
+    provider: "openai",
+    model: "gpt-6-sol",
+    usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 },
+    stopReason: "stop",
+    timestamp: Date.now() + 1,
+  } as any);
+  // Branching after the checkpoint keeps it on the active path and appends the
+  // summary as additive context after it.
+  session.branchWithSummary(assistantId, "summary of the abandoned branch");
+  assert.equal(session.getBranch().at(-1)?.type, "branch_summary");
+  assert.ok(
+    session.getBranch().some((entry) => entry.type === "compaction"),
+    "the branch summary must not remove the checkpoint from the active path",
+  );
+
+  const { ctx } = createContext(serverModel());
+  const tail = {
+    role: "assistant",
+    content: [{ type: "output_text", text: "after the checkpoint" }],
+  };
   const summary = {
     role: "user",
     content: [{ type: "input_text", text: "branch summary" }],
   };
-  const { ctx } = createContext(serverModel(), {
-    branch: [
-      { type: "compaction", details },
-      { type: "branch_summary", summary: "branched" },
-    ],
-  });
-  const payload: any = { input: [summary] };
+  const payload: any = {
+    input: [markerMessage(serverCompactionMarker("cp-branch")), tail, summary],
+  };
 
-  await handlers.get("before_provider_request")?.({ payload }, ctx);
+  await handlers
+    .get("before_provider_request")
+    ?.({ payload }, { ...ctx, sessionManager: session });
 
-  assert.deepEqual(payload.input, [summary]);
+  assert.deepEqual(payload.input, [item, tail, summary]);
+});
+
+test("a branch summary does not hide an older checkpoint behind a local summary", async () => {
+  const { handlers } = createHarness();
+  const session = SessionManager.inMemory("/tmp/pi-codex-branch-summary-local");
+  const userId = session.appendMessage({
+    role: "user",
+    content: [{ type: "text", text: "start" }],
+    timestamp: Date.now(),
+  } as any);
+  const item = { type: "compaction", id: "cmp_branch", encrypted_content: "opaque" };
+  const details = detailsFor("cp-branch", item);
+  const checkpointId = session.appendCompaction(
+    serverCompactionMarker("cp-branch"),
+    userId,
+    12_345,
+    details,
+    true,
+  );
+  const summaryId = session.branchWithSummary(
+    checkpointId,
+    "summary of the abandoned branch",
+  );
+  session.appendCompaction(
+    "local summary of the retained tail",
+    summaryId,
+    20_000,
+    undefined,
+    true,
+  );
+  assert.equal(session.getBranch().at(-1)?.type, "compaction");
+
+  const { ctx } = createContext(serverModel());
+  const localSummary = markerMessage("local summary of the retained tail");
+  const branchSummary = {
+    role: "user",
+    content: [{ type: "input_text", text: "branch summary" }],
+  };
+  const payload: any = { input: [localSummary, branchSummary] };
+
+  await handlers
+    .get("before_provider_request")
+    ?.({ payload }, { ...ctx, sessionManager: session });
+
+  assert.deepEqual(payload.input, [item, localSummary, branchSummary]);
 });
 
 test("prepending an older checkpoint is idempotent", () => {
@@ -834,10 +941,11 @@ test("request hook adds nothing when compaction is disabled or unsupported", asy
   }
   assert.equal(Object.hasOwn(noAppendPayload, "context_management"), false);
   assert.equal(Object.hasOwn(noAppendPayloadAgain, "context_management"), false);
-  assert.equal(
-    notices.filter((notice) => notice.includes("server-side compaction disabled")).length,
-    1,
+  const disabledNotices = notices.filter((notice) =>
+    notice.includes("server-side compaction disabled"),
   );
+  assert.equal(disabledNotices.length, 1);
+  assert.match(disabledNotices[0], /requires pi >= 0\.99\.0/);
 });
 
 test("provider auth failures propagate instead of disabling compaction", async () => {
@@ -866,6 +974,66 @@ test("settings read failures propagate instead of enabling compaction", async ()
         ?.({ payload: { input: [] } }, ctx),
     /settings read failed/,
   );
+});
+
+test("failed request preparation clears active server compaction state", async () => {
+  const settings = SettingsManager.inMemory({
+    compaction: { reserveTokens: 8_192 },
+  });
+  const server = serverModel();
+  const reserve = () => settings.getCompactionSettings(server).reserveTokens;
+
+  const healthy = createHarness();
+  const healthyCtx = createContext(server);
+  await healthy.handlers.get("session_start")?.({}, healthyCtx.ctx);
+  assert.equal(reserve(), 0);
+
+  // The settings read fails after the connection checks but before the
+  // request carries context_management; local compaction must get its
+  // reserve back.
+  const badSettings = createHarness({
+    settingsError: new Error("settings read failed"),
+  });
+  const badSettingsCtx = createContext(server);
+  await assert.rejects(
+    () =>
+      badSettings.handlers
+        .get("before_provider_request")
+        ?.({ payload: { input: [] } }, badSettingsCtx.ctx),
+    /settings read failed/,
+  );
+  assert.equal(reserve(), 8_192);
+
+  // A failed provider-auth lookup leaves the effective connection unknown.
+  await healthy.handlers.get("session_start")?.({}, healthyCtx.ctx);
+  assert.equal(reserve(), 0);
+  const badAuth = createContext(server, {
+    providerAuthError: new Error("credential refresh failed"),
+  });
+  await assert.rejects(
+    () =>
+      healthy.handlers
+        .get("before_provider_request")
+        ?.({ payload: { input: [] } }, badAuth.ctx),
+    /credential refresh failed/,
+  );
+  assert.equal(reserve(), 8_192);
+
+  // A model switch refreshes state too; a failed refresh must not retain the
+  // previous model's suppression.
+  await healthy.handlers.get("session_start")?.({}, healthyCtx.ctx);
+  assert.equal(reserve(), 0);
+  await assert.rejects(
+    () =>
+      healthy.handlers
+        .get("model_select")
+        ?.({ model: server }, { ...badAuth.ctx, model: server }),
+    /credential refresh failed/,
+  );
+  assert.equal(reserve(), 8_192);
+
+  healthy.handlers.get("session_shutdown")?.();
+  assert.equal(reserve(), 8_192);
 });
 
 test("checkpoint repair runs before every gate; only new compaction is gated", async () => {
@@ -1119,7 +1287,7 @@ test("persists one server checkpoint per turn and clears it at every boundary", 
   assert.equal(retried.details.item.id, "cmp_2");
 });
 
-test("turn_end retains only output emitted after the checkpoint", async () => {
+test("turn_end trims pre-checkpoint assistant output but keeps tool results", async () => {
   const { handlers } = createHarness();
   const { ctx } = createContext(serverModel());
   await handlers
@@ -1159,7 +1327,7 @@ test("turn_end retains only output emitted after the checkpoint", async () => {
 
   const before = { type: "text", text: "before the checkpoint" };
   const after = { type: "text", text: "after the checkpoint" };
-  const droppedCall = {
+  const absorbedCall = {
     type: "toolCall",
     id: "call_1|fc_1",
     name: "bash",
@@ -1175,7 +1343,7 @@ test("turn_end retains only output emitted after the checkpoint", async () => {
     {
       entries: [],
       messageEntryId: "assistant-1",
-      message: { role: "assistant", content: [before, droppedCall, after, retainedCall] },
+      message: { role: "assistant", content: [before, absorbedCall, after, retainedCall] },
       toolResults: [
         {
           role: "toolResult",
@@ -1196,32 +1364,24 @@ test("turn_end retains only output emitted after the checkpoint", async () => {
     },
     ctx,
   );
-  assert.equal(result.entries.length, 3);
+  assert.equal(result.entries.length, 2);
   assert.deepEqual(result.entries[0], {
     type: "context_edit",
     targetId: "assistant-1",
     replacement: { content: [after, retainedCall] },
   });
-  // The dropped tool call's result must be omitted from model context: an
-  // orphaned function_call_output makes the next Responses request 400.
-  assert.deepEqual(result.entries[1], {
-    type: "context_edit",
-    targetId: "tool-result-1",
-    replacement: null,
-  });
-  assert.equal(result.entries[2].type, "compaction");
-  assert.equal(result.entries[2].firstKeptEntryId, "assistant-1");
-  assert.equal(result.entries[2].details.item.id, "cmp_1");
-  // The retained call's result has no edit of its own.
+  assert.equal(result.entries[1].type, "compaction");
+  assert.equal(result.entries[1].firstKeptEntryId, "assistant-1");
+  assert.equal(result.entries[1].details.item.id, "cmp_1");
+  // No tool-result entry is edited: both results remain in model context,
+  // including the one whose call the checkpoint absorbed.
   assert.equal(
-    result.entries.filter(
-      (entry: any) => entry.targetId === "tool-result-2",
-    ).length,
-    0,
+    result.entries.filter((entry: any) => entry.type === "context_edit").length,
+    1,
   );
 });
 
-test("turn_end refuses to commit when tool result entry ids break the contract", async () => {
+test("turn_end commits even when tool result entry ids are unavailable", async () => {
   const { handlers } = createHarness();
   const { ctx } = createContext(serverModel());
   await handlers
@@ -1247,39 +1407,45 @@ test("turn_end refuses to commit when tool result entry ids break the contract",
     },
   });
 
-  const turnEnd = handlers.get("turn_end")!;
-  assert.throws(
-    () =>
-      turnEnd(
-        {
-          entries: [],
-          messageEntryId: "assistant-1",
-          message: {
-            role: "assistant",
-            content: [
-              {
-                type: "toolCall",
-                id: "call_1|fc_1",
-                name: "bash",
-                arguments: {},
-              },
-              { type: "text", text: "after" },
-            ],
+  // Tool results are retained as-is, so their entry ids are no longer part of
+  // the commit contract.
+  const result = handlers.get("turn_end")!(
+    {
+      entries: [],
+      messageEntryId: "assistant-1",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_1|fc_1",
+            name: "bash",
+            arguments: {},
           },
-          toolResults: [
-            {
-              role: "toolResult",
-              toolCallId: "call_1|fc_1",
-              toolName: "bash",
-              content: [],
-              timestamp: 1,
-            },
-          ],
-          toolResultEntryIds: [],
+          { type: "text", text: "after" },
+        ],
+      },
+      toolResults: [
+        {
+          role: "toolResult",
+          toolCallId: "call_1|fc_1",
+          toolName: "bash",
+          content: [],
+          timestamp: 1,
         },
-        ctx,
-      ),
-    /toolResultEntryIds/,
+      ],
+      toolResultEntryIds: [],
+    },
+    ctx,
+  );
+  assert.equal(
+    result.entries.filter((entry: any) => entry.type === "context_edit").length,
+    1,
+  );
+  assert.equal(
+    result.entries.find((entry: any) => entry.type === "compaction")?.details
+      .item.id,
+    "cmp_1",
   );
 });
 
