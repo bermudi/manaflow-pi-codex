@@ -16,6 +16,7 @@ import {
   isOpenAIServerCompactionModel,
   isServerCompactionCandidate,
   isServerCompactionDetails,
+  prependServerCompactionCheckpoint,
   SERVER_COMPACTION_KIND,
   SERVER_COMPACTION_VERSION,
   serverCompactionMarker,
@@ -27,7 +28,12 @@ import {
 
 type Handler = (...args: any[]) => any;
 
-function createHarness(options: { compactionEnabled?: boolean } = {}) {
+function createHarness(
+  options: {
+    compactionEnabled?: boolean;
+    settingsError?: Error;
+  } = {},
+) {
   const handlers = new Map<string, Handler>();
   const pi = {
     registerCommand() {},
@@ -36,9 +42,12 @@ function createHarness(options: { compactionEnabled?: boolean } = {}) {
     getActiveTools: () => [] as string[],
     getAllTools: () => [],
     setActiveTools() {},
-    getSettings: () => ({
-      compaction: { enabled: options.compactionEnabled ?? true },
-    }),
+    getSettings: () => {
+      if (options.settingsError) throw options.settingsError;
+      return {
+        compaction: { enabled: options.compactionEnabled ?? true },
+      };
+    },
     on(name: string, handler: Handler) {
       handlers.set(name, handler);
     },
@@ -67,10 +76,11 @@ function createContext(
   options: {
     branch?: any[];
     providerBaseUrl?: string | null;
+    providerAuthError?: Error;
     appendCompaction?: boolean;
   } = {},
 ) {
-  const appends: any[][] = [];
+  const directAppends: any[][] = [];
   const ctx = {
     model,
     thinkingLevel: "off",
@@ -78,6 +88,7 @@ function createContext(
     hasUI: false,
     modelRegistry: {
       async getProviderAuth() {
+        if (options.providerAuthError) throw options.providerAuthError;
         if (options.providerBaseUrl === null) return undefined;
         return {
           auth: { baseUrl: options.providerBaseUrl ?? model.baseUrl },
@@ -92,13 +103,13 @@ function createContext(
         ? {}
         : {
             appendCompaction(...args: any[]) {
-              appends.push(args);
+              directAppends.push(args);
               return "compaction-entry";
             },
           }),
     },
   };
-  return { ctx, appends };
+  return { ctx, directAppends };
 }
 
 function detailsFor(checkpointId: string, item: any): ServerCompactionDetails {
@@ -265,7 +276,10 @@ test("server checkpoint replacement works through pi's compaction projection", a
   } as any);
   const assistantId = session.appendMessage({
     role: "assistant",
-    content: [{ type: "text", text: "retained tail" }],
+    content: [
+      { type: "text", text: "before the checkpoint" },
+      { type: "text", text: "retained tail" },
+    ],
     api: "openai-responses",
     provider: "openai",
     model: "gpt-6-sol",
@@ -273,6 +287,11 @@ test("server checkpoint replacement works through pi's compaction projection", a
     stopReason: "stop",
     timestamp: timestamp + 1,
   } as any);
+  // The server checkpoint covers the first text block; only the continuation
+  // after the compaction item belongs in the next request.
+  session.appendContextEdit(assistantId, {
+    content: [{ type: "text", text: "retained tail" }],
+  });
   const item = { type: "compaction", id: "cmp_real", encrypted_content: "opaque" };
   const details = detailsFor("cp-real", item);
   session.appendCompaction(
@@ -301,6 +320,87 @@ test("server checkpoint replacement works through pi's compaction projection", a
   assert.deepEqual(payload.input[0], item);
   assert.equal(payload.input.length, 2);
   assert.equal((payload.input[1] as any).role, "assistant");
+  assert.match(JSON.stringify(payload.input[1]), /retained tail/);
+  assert.doesNotMatch(JSON.stringify(payload.input), /before the checkpoint/);
+});
+
+test("an older server checkpoint survives a later local compaction", async () => {
+  const { convertResponsesMessages } = await import(
+    "../src/vendor/openai-responses-shared.mjs"
+  );
+  const session = SessionManager.inMemory("/tmp/pi-codex-local-compaction-test");
+  const timestamp = Date.now();
+  session.appendMessage({
+    role: "user",
+    content: [{ type: "text", text: "history before the checkpoint" }],
+    timestamp,
+  } as any);
+  const firstAssistant = session.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "answer before the checkpoint" }],
+    api: "openai-responses",
+    provider: "openai",
+    model: "gpt-6-sol",
+    usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 },
+    stopReason: "stop",
+    timestamp: timestamp + 1,
+  } as any);
+  const item = { type: "compaction", id: "cmp_old", encrypted_content: "opaque" };
+  const details = detailsFor("cp-old", item);
+  session.appendCompaction(
+    serverCompactionMarker("cp-old"),
+    firstAssistant,
+    10_000,
+    details,
+    true,
+  );
+  session.appendMessage({
+    role: "user",
+    content: [{ type: "text", text: "later question" }],
+    timestamp: timestamp + 2,
+  } as any);
+  const secondAssistant = session.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "later answer" }],
+    api: "openai-responses",
+    provider: "openai",
+    model: "gpt-6-sol",
+    usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 },
+    stopReason: "stop",
+    timestamp: timestamp + 3,
+  } as any);
+  // Pi feeds the previous summary (the opaque marker) into the local
+  // summarizer, so the generated summary can retain that text. The request
+  // hook must prepend the checkpoint, not replace the whole local summary.
+  session.appendCompaction(
+    `${serverCompactionMarker("cp-old")}\n\nlocal summary of the later question and answer`,
+    secondAssistant,
+    500,
+    { readFiles: [], modifiedFiles: [] },
+    true,
+  );
+
+  const projected = session.buildSessionProjection();
+  const input = (convertResponsesMessages as any)(
+    serverModel(),
+    { messages: convertToLlm(projected.messages) },
+    new Set(["openai"]),
+    { includeSystemPrompt: false, grammarToolInputProperties: new Map() },
+  ) as any[];
+  assert.equal(input.length, 2);
+  assert.match(JSON.stringify(input[0]), /local summary/);
+
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel(), { branch: session.getBranch() });
+  const payload: any = { input };
+  await handlers.get("before_provider_request")?.({ payload }, ctx);
+
+  assert.deepEqual(payload.input[0], item);
+  assert.match(JSON.stringify(payload.input[1]), /pi-codex server compaction cp-old/);
+  assert.match(JSON.stringify(payload.input[1]), /local summary/);
+  assert.match(JSON.stringify(payload.input[2]), /later answer/);
+  assert.equal(payload.input.length, 3);
+  assert.doesNotMatch(JSON.stringify(payload.input), /history before the checkpoint/);
 });
 
 test("server compaction details are distinguishable from legacy checkpoints", () => {
@@ -396,6 +496,62 @@ test("stream capture uses response.completed output as a fallback", () => {
   );
 });
 
+test("stream capture tracks assistant content emitted before the latest checkpoint", () => {
+  const compaction = { type: "compaction", id: "cmp_1", encrypted_content: "opaque" };
+  let capture = updateServerCompactionCapture(undefined, {
+    type: "response.output_item.added",
+    output_index: 0,
+    item: { type: "message", role: "assistant", content: [] },
+  });
+  capture = updateServerCompactionCapture(capture, {
+    type: "response.output_item.added",
+    output_index: 1,
+    item: {
+      type: "function_call",
+      call_id: "call_1",
+      id: "fc_1",
+      name: "bash",
+      arguments: "{}",
+    },
+  });
+  // Duplicate added events for one index must not double-count content.
+  capture = updateServerCompactionCapture(capture, {
+    type: "response.output_item.added",
+    output_index: 1,
+    item: {
+      type: "function_call",
+      call_id: "call_1",
+      id: "fc_1",
+      name: "bash",
+      arguments: "{}",
+    },
+  });
+  capture = updateServerCompactionCapture(capture, {
+    type: "response.output_item.done",
+    item: compaction,
+  });
+  assert.equal(capture?.contentCount, 2);
+  assert.equal(capture?.contentCountBefore, 2);
+
+  // A compaction item itself never creates an assistant content block.
+  capture = updateServerCompactionCapture(capture, {
+    type: "response.output_item.added",
+    output_index: 2,
+    item: compaction,
+  });
+  assert.equal(capture?.contentCount, 2);
+
+  // The terminal output is authoritative for the boundary.
+  capture = updateServerCompactionCapture(capture, {
+    type: "response.completed",
+    response: {
+      output: [{ type: "message", role: "assistant" }, compaction],
+      usage: { input_tokens: 1 },
+    },
+  });
+  assert.equal(capture?.contentCountBefore, 1);
+});
+
 test("tokensBefore prefers input tokens and falls back to total tokens", () => {
   assert.equal(serverCompactionTokensBefore({ input_tokens: 8_689 }), 8_689);
   assert.equal(serverCompactionTokensBefore({ total_tokens: 9_000 }), 9_000);
@@ -419,6 +575,67 @@ test("request hook installs the latest checkpoint and 90% context management", a
   assert.deepEqual(payload.context_management, [
     { type: "compaction", compact_threshold: 244_800 },
   ]);
+});
+
+test("request hook keeps an older checkpoint ahead of a later local summary", async () => {
+  const { handlers } = createHarness();
+  const item = { type: "compaction", id: "cmp_old", encrypted_content: "opaque" };
+  const details = detailsFor("cp-old", item);
+  const localSummary = {
+    role: "user",
+    content: [{ type: "input_text", text: "local summary of the later tail" }],
+  };
+  const tail = { role: "user", content: [{ type: "input_text", text: "tail" }] };
+  const { ctx } = createContext(serverModel(), {
+    branch: [
+      { type: "compaction", id: "server-entry", details },
+      {
+        type: "compaction",
+        id: "local-entry",
+        details: { readFiles: [], modifiedFiles: [] },
+      },
+    ],
+  });
+  const payload: any = { input: [localSummary, tail] };
+
+  await handlers.get("before_provider_request")?.({ payload }, ctx);
+
+  assert.deepEqual(payload.input, [item, localSummary, tail]);
+  assert.deepEqual(payload.context_management, [
+    { type: "compaction", compact_threshold: 244_800 },
+  ]);
+});
+
+test("a branch summary after the checkpoint stops reinstallation", async () => {
+  const { handlers } = createHarness();
+  const item = { type: "compaction", id: "cmp_old", encrypted_content: "opaque" };
+  const details = detailsFor("cp-old", item);
+  const summary = {
+    role: "user",
+    content: [{ type: "input_text", text: "branch summary" }],
+  };
+  const { ctx } = createContext(serverModel(), {
+    branch: [
+      { type: "compaction", details },
+      { type: "branch_summary", summary: "branched" },
+    ],
+  });
+  const payload: any = { input: [summary] };
+
+  await handlers.get("before_provider_request")?.({ payload }, ctx);
+
+  assert.deepEqual(payload.input, [summary]);
+});
+
+test("prepending an older checkpoint is idempotent", () => {
+  const item = { type: "compaction", id: "cmp_old", encrypted_content: "opaque" };
+  const details = detailsFor("cp-old", item);
+  const summary = markerMessage("local summary");
+  const payload: any = { input: [item, summary] };
+
+  prependServerCompactionCheckpoint(payload, details);
+
+  assert.deepEqual(payload.input, [item, summary]);
 });
 
 test("request hook respects an existing context_management field", async () => {
@@ -487,9 +704,37 @@ test("request hook adds nothing when compaction is disabled or unsupported", asy
   );
 });
 
+test("provider auth failures propagate instead of disabling compaction", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel(), {
+    providerAuthError: new Error("credential refresh failed"),
+  });
+  await assert.rejects(
+    () =>
+      handlers
+        .get("before_provider_request")
+        ?.({ payload: { input: [] } }, ctx),
+    /credential refresh failed/,
+  );
+});
+
+test("settings read failures propagate instead of enabling compaction", async () => {
+  const { handlers } = createHarness({
+    settingsError: new Error("settings read failed"),
+  });
+  const { ctx } = createContext(serverModel());
+  await assert.rejects(
+    () =>
+      handlers
+        .get("before_provider_request")
+        ?.({ payload: { input: [] } }, ctx),
+    /settings read failed/,
+  );
+});
+
 test("persists one server checkpoint per turn and clears it at every boundary", async () => {
   const { handlers } = createHarness();
-  const { ctx, appends } = createContext(serverModel());
+  const { ctx, directAppends } = createContext(serverModel());
   const request = handlers.get("before_provider_request")!;
   const streamEvent = handlers.get("provider_stream_event")!;
   const turnStart = handlers.get("turn_start")!;
@@ -500,6 +745,22 @@ test("persists one server checkpoint per turn and clears it at every boundary", 
   const second = { type: "compaction", id: "cmp_2", encrypted_content: "two" };
   const usage = { input_tokens: 8_689, output_tokens: 20 };
   const payload = () => ({ input: [] as unknown[] });
+
+  function commit(messageEntryId: string): any | undefined {
+    return turnEnd(
+      {
+        entries: [],
+        messageEntryId,
+        message: { role: "assistant", content: [] },
+        toolResults: [],
+      },
+      ctx,
+    );
+  }
+
+  function compactionDraft(result: any): any {
+    return result?.entries?.find((entry: any) => entry.type === "compaction");
+  }
 
   async function capture(item: any, tokenUsage?: Record<string, unknown>) {
     await request({ payload: payload() }, ctx);
@@ -520,42 +781,41 @@ test("persists one server checkpoint per turn and clears it at every boundary", 
   }
 
   await capture(first, usage);
-  turnEnd({ messageEntryId: "assistant-entry-1" }, ctx);
-  assert.equal(appends.length, 1);
-  const [summary, firstKeptEntryId, tokensBefore, details, fromHook, piUsage] =
-    appends[0];
-  assert.match(summary, /^\[pi-codex server compaction [0-9a-f-]{36}\]$/);
-  assert.equal(firstKeptEntryId, "assistant-entry-1");
-  assert.equal(tokensBefore, 8_689);
-  assert.equal(details.type, "pi-codex-server-compaction");
-  assert.equal(details.version, 1);
-  assert.equal(details.item.id, "cmp_1");
-  assert.equal(details.modelId, "gpt-6-sol");
-  assert.deepEqual(details.tokenUsage, usage);
-  assert.equal(fromHook, true);
-  assert.equal(piUsage.input, 8_689);
-  assert.equal(piUsage.output, 20);
+  const firstCommit = compactionDraft(commit("assistant-entry-1"));
+  assert.equal(
+    directAppends.length,
+    0,
+    "the checkpoint must go through turn_end drafts so entry_appended fires",
+  );
+  assert.match(
+    firstCommit.summary,
+    /^\[pi-codex server compaction [0-9a-f-]{36}\]$/,
+  );
+  assert.equal(firstCommit.firstKeptEntryId, "assistant-entry-1");
+  assert.equal(firstCommit.details.type, "pi-codex-server-compaction");
+  assert.equal(firstCommit.details.version, 1);
+  assert.equal(firstCommit.details.item.id, "cmp_1");
+  assert.equal(firstCommit.details.modelId, "gpt-6-sol");
+  assert.deepEqual(firstCommit.details.tokenUsage, usage);
+  assert.equal(firstCommit.usage.input, 8_689);
+  assert.equal(firstCommit.usage.output, 20);
 
-  // A second turn_end without a capture must not append again.
-  turnEnd({ messageEntryId: "assistant-entry-1" }, ctx);
-  assert.equal(appends.length, 1);
+  // A second turn_end without a capture must not commit again.
+  assert.equal(commit("assistant-entry-1"), undefined);
 
   // A capture from an aborted/retried turn is discarded at turn_start,
   // agent_end, and session_start.
   await capture(first);
   turnStart({ turnIndex: 1, timestamp: 1 });
-  turnEnd({ messageEntryId: "assistant-entry-2" }, ctx);
-  assert.equal(appends.length, 1);
+  assert.equal(commit("assistant-entry-2"), undefined);
 
   await capture(first);
   agentEnd({ messages: [] });
-  turnEnd({ messageEntryId: "assistant-entry-2" }, ctx);
-  assert.equal(appends.length, 1);
+  assert.equal(commit("assistant-entry-2"), undefined);
 
   await capture(first);
   await sessionStart({}, ctx);
-  turnEnd({ messageEntryId: "assistant-entry-2" }, ctx);
-  assert.equal(appends.length, 1);
+  assert.equal(commit("assistant-entry-2"), undefined);
 
   // A retried provider request resets the slot and re-captures; only the last
   // item is committed once.
@@ -573,9 +833,119 @@ test("persists one server checkpoint per turn and clears it at every boundary", 
     model: "gpt-6-sol",
     data: { type: "response.output_item.done", item: second },
   });
-  turnEnd({ messageEntryId: "assistant-entry-3" }, ctx);
-  assert.equal(appends.length, 2);
-  assert.equal(appends[1][3].item.id, "cmp_2");
+  const retried = compactionDraft(commit("assistant-entry-3"));
+  assert.equal(retried.details.item.id, "cmp_2");
+});
+
+test("turn_end retains only output emitted after the checkpoint", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel());
+  await handlers
+    .get("before_provider_request")
+    ?.({ payload: { input: [] } }, ctx);
+
+  const stream = (data: any) =>
+    handlers.get("provider_stream_event")?.({
+      provider: "openai",
+      api: "openai-responses",
+      model: "gpt-6-sol",
+      data,
+    });
+  const message = { type: "message", role: "assistant", content: [] };
+  const call = {
+    type: "function_call",
+    call_id: "call_1",
+    id: "fc_1",
+    name: "bash",
+    arguments: "{}",
+  };
+  stream({ type: "response.output_item.added", output_index: 0, item: message });
+  stream({ type: "response.output_item.added", output_index: 1, item: call });
+  stream({
+    type: "response.output_item.done",
+    item: { type: "compaction", id: "cmp_1", encrypted_content: "opaque" },
+  });
+  stream({ type: "response.output_item.added", output_index: 2, item: message });
+
+  const before = { type: "text", text: "before the checkpoint" };
+  const after = { type: "text", text: "after the checkpoint" };
+  const toolCall = {
+    type: "toolCall",
+    id: "call_1|fc_1",
+    name: "bash",
+    arguments: { command: "ls" },
+  };
+  const result = handlers.get("turn_end")?.(
+    {
+      entries: [],
+      messageEntryId: "assistant-1",
+      message: { role: "assistant", content: [before, toolCall, after] },
+      toolResults: [
+        {
+          role: "toolResult",
+          toolCallId: "call_1|fc_1",
+          toolName: "bash",
+          content: [],
+          timestamp: 1,
+        },
+      ],
+    },
+    ctx,
+  );
+  assert.equal(result.entries.length, 2);
+  assert.equal(result.entries[0].type, "context_edit");
+  assert.deepEqual(result.entries[0], {
+    type: "context_edit",
+    targetId: "assistant-1",
+    replacement: { content: [after] },
+  });
+  assert.equal(result.entries[1].type, "compaction");
+  assert.equal(result.entries[1].firstKeptEntryId, "assistant-1");
+  assert.equal(result.entries[1].details.item.id, "cmp_1");
+});
+
+test("turn_end omits the assistant message when the checkpoint covers all output", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel());
+  await handlers
+    .get("before_provider_request")
+    ?.({ payload: { input: [] } }, ctx);
+
+  const stream = (data: any) =>
+    handlers.get("provider_stream_event")?.({
+      provider: "openai",
+      api: "openai-responses",
+      model: "gpt-6-sol",
+      data,
+    });
+  stream({
+    type: "response.output_item.added",
+    output_index: 0,
+    item: { type: "message", role: "assistant", content: [] },
+  });
+  stream({
+    type: "response.output_item.done",
+    item: { type: "compaction", id: "cmp_1", encrypted_content: "opaque" },
+  });
+
+  const result = handlers.get("turn_end")?.(
+    {
+      entries: [],
+      messageEntryId: "assistant-1",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "only before the checkpoint" }],
+      },
+      toolResults: [],
+    },
+    ctx,
+  );
+  const edit = result.entries.find((entry: any) => entry.type === "context_edit");
+  assert.deepEqual(edit, {
+    type: "context_edit",
+    targetId: "assistant-1",
+    replacement: null,
+  });
 });
 
 test("server models suppress the local threshold but keep local summarization usable", async () => {

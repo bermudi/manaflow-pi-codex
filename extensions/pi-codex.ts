@@ -36,12 +36,12 @@ import {
   isServerCompactionCandidate,
   isServerCompactionDetails,
   parseRemoteCompactionSse,
+  prependServerCompactionCheckpoint,
   retainedContextItems,
   REMOTE_COMPACTION_VERSION,
   SERVER_COMPACTION_KIND,
   SERVER_COMPACTION_VERSION,
   serverCompactionMarker,
-  serverCompactionTokensBefore,
   toPiUsage,
   updateServerCompactionCapture,
   type RemoteCompactionDetails,
@@ -639,23 +639,55 @@ export default function piCodex(pi: ExtensionAPI) {
       ?.details as RemoteCompactionDetails | undefined;
   }
 
-  function latestServerCompaction(ctx: { sessionManager: { getBranch(): readonly any[] } }) {
-    return [...ctx.sessionManager.getBranch()]
-      .reverse()
-      .find((entry: any) => entry.type === "compaction" && isServerCompactionDetails(entry.details))
-      ?.details as ServerCompactionDetails | undefined;
+  type ServerCompactionInstallPlan =
+    | { mode: "replace"; details: ServerCompactionDetails }
+    | { mode: "prepend"; details: ServerCompactionDetails };
+
+  /**
+   * Find the checkpoint that applies to the current projection.
+   *
+   * - Latest boundary is the server compaction: replace its marker.
+   * - Latest boundary is a local compaction: the server checkpoint is older
+   *   but still owns the prefix that the local summary cannot see. Prepend it.
+   * - Latest boundary is a branch summary: the branch has moved past the
+   *   checkpoint, so leave the request alone.
+   */
+  function serverCompactionInstallPlan(ctx: {
+    sessionManager: { getBranch(): readonly any[] };
+  }): ServerCompactionInstallPlan | undefined {
+    const branch = ctx.sessionManager.getBranch();
+    for (let index = branch.length - 1; index >= 0; index--) {
+      const entry = branch[index] as any;
+      if (entry?.type === "branch_summary") return undefined;
+      if (entry?.type !== "compaction") continue;
+      if (isServerCompactionDetails(entry.details)) {
+        return { mode: "replace", details: entry.details };
+      }
+      for (let older = index - 1; older >= 0; older--) {
+        const candidate = branch[older] as any;
+        if (candidate?.type === "branch_summary") return undefined;
+        if (
+          candidate?.type === "compaction" &&
+          isServerCompactionDetails(candidate.details)
+        ) {
+          return { mode: "prepend", details: candidate.details };
+        }
+      }
+      return undefined;
+    }
+    return undefined;
   }
 
   async function resolveProviderBaseUrl(
     ctx: any,
     model: Model<any>,
   ): Promise<string | undefined> {
-    try {
-      const providerAuth = await ctx?.modelRegistry?.getProviderAuth?.(model.provider);
-      return providerAuth?.auth?.baseUrl ?? undefined;
-    } catch {
-      return undefined;
-    }
+    // A failed auth lookup is not evidence of "no base-URL override": it means
+    // the effective connection could not be established. Let the extension
+    // boundary report it instead of silently enabling server compaction on the
+    // model's default base URL.
+    const providerAuth = await ctx?.modelRegistry?.getProviderAuth?.(model.provider);
+    return providerAuth?.auth?.baseUrl ?? undefined;
   }
 
   async function refreshServerCompactionState(ctx: any, model: Model<any> | undefined) {
@@ -671,13 +703,11 @@ export default function piCodex(pi: ExtensionAPI) {
   }
 
   function serverCompactionEnabled(): boolean {
-    try {
-      const settings =
-        typeof pi.getSettings === "function" ? pi.getSettings() : undefined;
-      return settings?.compaction?.enabled ?? true;
-    } catch {
-      return true;
-    }
+    // Missing getSettings is a compatibility fallback; a thrown read is a real
+    // failure and must not be converted into "compaction is enabled".
+    const settings =
+      typeof pi.getSettings === "function" ? pi.getSettings() : undefined;
+    return settings?.compaction?.enabled ?? true;
   }
 
   function hasServerCompactionAppend(ctx: any): boolean {
@@ -1311,8 +1341,12 @@ export default function piCodex(pi: ExtensionAPI) {
     serverCompactionAppendAvailable = true;
     updateServerCompactionState(model, providerBaseUrl);
 
-    const details = latestServerCompaction(ctx);
-    if (details) installServerCompactionCheckpoint(event.payload, details);
+    const plan = serverCompactionInstallPlan(ctx);
+    if (plan?.mode === "replace") {
+      installServerCompactionCheckpoint(event.payload, plan.details);
+    } else if (plan?.mode === "prepend") {
+      prependServerCompactionCheckpoint(event.payload, plan.details);
+    }
 
     installServerCompactionContextManagement(
       event.payload,
@@ -1362,8 +1396,8 @@ export default function piCodex(pi: ExtensionAPI) {
     retryTurnState = undefined;
     turnState = undefined;
     const capture = serverCompactionCapture;
-    // One append per turn: clear before writing so a failure or a second
-    // turn_end cannot commit the same item twice.
+    // One commit per turn: clear before returning drafts so a failure or a
+    // second turn_end cannot commit the same item twice.
     serverCompactionCapture = undefined;
     if (!capture?.item) return;
     if (!supportsServerCompactionAppend(ctx)) return;
@@ -1378,21 +1412,39 @@ export default function piCodex(pi: ExtensionAPI) {
       modelId: ctx.model?.id ?? "",
       ...(tokenUsage ? { tokenUsage } : {}),
     };
-    const appendCompaction = (
-      ctx.sessionManager as unknown as {
-        appendCompaction?: (...args: any[]) => unknown;
-      }
-    ).appendCompaction;
-    if (typeof appendCompaction !== "function") return;
-    appendCompaction.call(
-      ctx.sessionManager,
-      serverCompactionMarker(checkpointId),
-      event.messageEntryId,
-      serverCompactionTokensBefore(tokenUsage),
-      details,
-      true,
-      tokenUsage ? toPiUsage(tokenUsage) : undefined,
+
+    const entries: any[] = [...event.entries];
+    const content = Array.isArray((event.message as any).content)
+      ? ((event.message as any).content as any[])
+      : [];
+    const splitAt = Math.max(
+      0,
+      Math.min(capture.contentCountBefore ?? 0, content.length),
     );
+    if (capture.contentCountBefore !== undefined && splitAt > 0) {
+      // The server folds everything before its compaction item into the
+      // checkpoint, including the assistant output emitted before it. Pi has
+      // already merged that output and the continuation into one assistant
+      // message, so an append-only context edit retains only the continuation.
+      // Tool calls before the boundary are covered by the checkpoint; their
+      // results remain as separate entries after it.
+      const retained = content.slice(splitAt);
+      entries.push({
+        type: "context_edit",
+        targetId: event.messageEntryId,
+        replacement: retained.length > 0 ? { content: retained } : null,
+      });
+    }
+
+    const piUsage = tokenUsage ? toPiUsage(tokenUsage) : undefined;
+    entries.push({
+      type: "compaction",
+      summary: serverCompactionMarker(checkpointId),
+      firstKeptEntryId: event.messageEntryId,
+      details,
+      ...(piUsage ? { usage: piUsage } : {}),
+    });
+    return { entries };
   });
   pi.on("agent_start", (_event, ctx) => {
     startWorkingTicker(ctx);

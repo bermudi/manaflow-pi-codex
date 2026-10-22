@@ -97,6 +97,16 @@ export interface ServerCompactionDetails {
 export interface ServerCompactionCapture {
   item?: ResponseItem;
   tokenUsage?: Record<string, unknown>;
+  /**
+   * Number of assistant content blocks emitted before the latest compaction
+   * item. Pi aggregates one response into one assistant message; turn_end uses
+   * this boundary to replace its pre-compaction prefix with a context edit.
+   */
+  contentCountBefore?: number;
+  /** Internal running count of content output items in this stream. */
+  contentCount?: number;
+  /** Internal output indexes already counted, for duplicate `added` events. */
+  contentOutputIndexes?: Set<number>;
 }
 
 export function isRemoteCompactionDetails(value: unknown): value is RemoteCompactionDetails {
@@ -208,13 +218,48 @@ function objectValue(value: unknown): Record<string, any> | undefined {
     : undefined;
 }
 
+function lastCompactionIndex(output: unknown[]): number {
+  for (let index = output.length - 1; index >= 0; index--) {
+    if (objectValue(output[index])?.type === "compaction") return index;
+  }
+  return -1;
+}
+
 function lastCompactionItem(output: unknown): ResponseItem | undefined {
   if (!Array.isArray(output)) return undefined;
-  for (let index = output.length - 1; index >= 0; index--) {
-    const item = objectValue(output[index]);
-    if (item?.type === "compaction") return item as ResponseItem;
-  }
-  return undefined;
+  const index = lastCompactionIndex(output);
+  return index < 0 ? undefined : (objectValue(output[index]) as ResponseItem);
+}
+
+/** Output items that Pi turns into one assistant content block each. */
+function isAssistantContentOutputItem(item: Record<string, any> | undefined): boolean {
+  return (
+    item?.type === "reasoning" ||
+    item?.type === "message" ||
+    item?.type === "function_call" ||
+    item?.type === "custom_tool_call"
+  );
+}
+
+/**
+ * Count one content-creating output item by output index. Added events are the
+ * normal source; the done path is a fallback for a stream that skipped them.
+ */
+function countAssistantContent(
+  capture: ServerCompactionCapture | undefined,
+  event: Record<string, any>,
+): ServerCompactionCapture | undefined {
+  if (!isAssistantContentOutputItem(objectValue(event.item))) return capture;
+  const outputIndex =
+    typeof event.output_index === "number" ? event.output_index : undefined;
+  const indexes = new Set(capture?.contentOutputIndexes ?? []);
+  if (outputIndex !== undefined && indexes.has(outputIndex)) return capture;
+  if (outputIndex !== undefined) indexes.add(outputIndex);
+  return {
+    ...capture,
+    contentCount: (capture?.contentCount ?? 0) + 1,
+    ...(indexes.size > 0 ? { contentOutputIndexes: indexes } : {}),
+  };
 }
 
 function responseUsage(event: Record<string, any>): Record<string, unknown> | undefined {
@@ -229,6 +274,11 @@ function responseUsage(event: Record<string, any>): Record<string, unknown> | un
  * Output-item events replace the item (the last one is authoritative);
  * response.completed fills in the authoritative item from response.output and
  * the usage used for `tokensBefore`.
+ *
+ * Content positions are tracked from `response.output_item.added`: Pi creates
+ * one assistant content block per reasoning/message/function-call item at that
+ * point. The count before the latest compaction lets turn_end drop output that
+ * the server already folded into the checkpoint.
  */
 export function updateServerCompactionCapture(
   capture: ServerCompactionCapture | undefined,
@@ -237,19 +287,44 @@ export function updateServerCompactionCapture(
   const event = objectValue(data);
   if (!event) return capture;
 
+  if (event.type === "response.output_item.added") {
+    return countAssistantContent(capture, event);
+  }
+
   if (event.type === "response.output_item.done") {
     const item = objectValue(event.item);
-    if (item?.type !== "compaction") return capture;
-    return { ...capture, item: item as ResponseItem };
+    if (item?.type !== "compaction") {
+      return countAssistantContent(capture, event);
+    }
+    return {
+      ...capture,
+      item: item as ResponseItem,
+      ...(capture?.contentCount !== undefined
+        ? { contentCountBefore: capture.contentCount }
+        : {}),
+    };
   }
 
   if (event.type !== "response.completed") return capture;
-  const completedItem = lastCompactionItem(event.response?.output);
+  const output = Array.isArray(event.response?.output)
+    ? (event.response.output as unknown[])
+    : undefined;
+  const completedItem = lastCompactionItem(output);
   const tokenUsage = responseUsage(event);
   if (!completedItem && !tokenUsage) return capture;
+  const completedIndex = output ? lastCompactionIndex(output) : -1;
+  const completedContentCount =
+    output && completedIndex >= 0
+      ? output
+          .slice(0, completedIndex)
+          .filter((item) => isAssistantContentOutputItem(objectValue(item))).length
+      : undefined;
   return {
     ...capture,
     ...(completedItem ? { item: completedItem } : {}),
+    ...(completedContentCount !== undefined
+      ? { contentCountBefore: completedContentCount }
+      : {}),
     ...(tokenUsage ? { tokenUsage } : {}),
   };
 }
@@ -304,6 +379,63 @@ export function installServerCompactionCheckpoint(
   const index = matchingIndexes[0];
   if (markerCount(body.input[index], marker) !== 1) return payload;
   body.input.splice(index, 1, details.item);
+  return payload;
+}
+
+function isSystemConversationItem(value: unknown): boolean {
+  const item = objectValue(value);
+  return (
+    item?.role === "system" ||
+    item?.role === "developer" ||
+    item?.type === "system" ||
+    item?.type === "developer"
+  );
+}
+
+function compactionItemIdentity(item: Record<string, any> | undefined): string | undefined {
+  if (item?.type !== "compaction") return undefined;
+  if (typeof item.encrypted_content === "string" && item.encrypted_content.length > 0) {
+    return `encrypted:${item.encrypted_content}`;
+  }
+  if (typeof item.id === "string" && item.id.length > 0) return `id:${item.id}`;
+  return undefined;
+}
+
+/**
+ * Keep an older server checkpoint ahead of a later local compaction.
+ *
+ * Pi's local summarizer sees only the opaque marker as `previousSummary`; the
+ * history before that marker is not in `messagesToSummarize`. The summary that
+ * replaces the marker therefore covers the retained tail, not the checkpointed
+ * prefix. Reinsert the opaque item before the local summary so the next request
+ * sees checkpoint + tail summary instead of silently losing the prefix.
+ */
+export function prependServerCompactionCheckpoint(
+  payload: unknown,
+  details: ServerCompactionDetails,
+): unknown {
+  if (!payload || typeof payload !== "object") return payload;
+  const item = objectValue((details as { item?: unknown }).item);
+  if (!item) return payload;
+  const body = payload as { input?: unknown[] };
+  if (!Array.isArray(body.input)) return payload;
+  const identity = compactionItemIdentity(item);
+  if (
+    identity &&
+    body.input.some(
+      (entry) => compactionItemIdentity(objectValue(entry)) === identity,
+    )
+  ) {
+    return payload;
+  }
+  const firstConversation = body.input.findIndex(
+    (entry) => !isSystemConversationItem(entry),
+  );
+  body.input.splice(
+    firstConversation === -1 ? body.input.length : firstConversation,
+    0,
+    details.item,
+  );
   return payload;
 }
 

@@ -117,17 +117,20 @@ For pi's built-in `openai` provider using the Responses API (`api: "openai-respo
 
 - Each request carries `context_management: [{ "type": "compaction", "compact_threshold": <90% of the model context window> }]` unless the request already has `context_management`. The threshold is floored and clamped to the API minimum of 1000; a 272,000-token window uses 244,800.
 - The final compaction item from the response stream (`response.output_item.done`, falling back to the last compaction item in `response.completed`) is persisted as a `pi-codex-server-compaction` checkpoint together with its token usage. Later requests replace the checkpoint marker in the input with that opaque item exactly once; missing, duplicated, or stale markers are ignored.
+- The checkpoint is committed through pi's `turn_end` boundary drafts, not by calling `SessionManager.appendCompaction` directly. Pi therefore emits `entry_appended` for the checkpoint, so the interactive transcript, compaction notice, and footer update normally.
+- Output emitted before the compaction item was already folded into the checkpoint. Pi aggregates the whole response into one assistant message, so the extension adds an append-only `context_edit` that retains only the post-checkpoint suffix. Text and tool calls before the checkpoint are covered by the opaque item; their tool results remain as separate entries after it. Without this, the next request would contain the checkpoint followed by output it already covers (`C → A → B` instead of `C → B`).
 - pi's local compaction threshold is suppressed for this connection by returning `reserveTokens: 0` from the in-memory settings patch, so the server's 90% threshold gets the crossing request. Overflow recovery still force-compacts because it is independent of the reserve; the configured reserve is restored for that local summary path.
 
-`/compact` on this connection remains pi-local summarization. The extension restores the configured reserve for that path so the local summary has a usable output budget.
+`/compact` on this connection remains pi-local summarization. The extension restores the configured reserve for that path so the local summary has a usable output budget. If a server checkpoint already exists, pi's local summarizer sees only the opaque marker as its previous summary and summarizes the retained tail. The extension keeps the older checkpoint item ahead of that new local summary at request time, so a local compaction cannot silently drop the checkpointed prefix.
 
 Caveats:
 
-- The context meter under-reports the effective context after a server compaction: pi sees the marker/opaque item, not the server's compressed token count.
-- Server items are tied to the model and account that produced them. Switching models after a server compaction is not supported by this path; start a new session or compact locally.
+- The context meter under-reports the effective context after a server compaction: pi sees the marker/opaque item, not the server's compressed token count. The `context_edit` does remove pre-checkpoint assistant output from pi's estimate.
+- Server items are tied to the model and account that produced them. Switching models after a server compaction is not supported by this path; start a new session.
 - Proxy or auth-overridden base URLs (anything other than `https://api.openai.com/v1`) skip server compaction. A model may opt out with `compat.supportsServerCompaction: false`.
 - API-key mode is assumed to have the same Responses behavior as OAuth, but that path has not been live-tested.
-- Requires a pi build with `SessionManager.appendCompaction` (pi 1.3+). Without it the extension logs one notice and leaves the request untouched.
+- Requires a pi build with `SessionManager.appendCompaction` and `turn_end` boundary drafts (pi 1.3+). Without it the extension logs one notice and leaves the request untouched.
+- Provider-auth lookup failures and settings-read failures are surfaced to pi's extension error boundary instead of being treated as “no override” or “compaction enabled.” A request is not silently enabled or disabled on a failed read.
 
 The package targets pi's extension APIs and is developed against Pi 1.3. It does not attempt to reproduce Codex's
 subagent tool surface yet. First-class namespace routing, model-owned tool
