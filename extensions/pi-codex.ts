@@ -29,12 +29,24 @@ import {
   fetchRemoteCompaction,
   fingerprintCheckpointSuffix,
   installRemoteCheckpoint,
+  installServerCompactionCheckpoint,
+  installServerCompactionContextManagement,
+  isOpenAIServerCompactionModel,
   isRemoteCompactionDetails,
+  isServerCompactionCandidate,
+  isServerCompactionDetails,
   parseRemoteCompactionSse,
   retainedContextItems,
   REMOTE_COMPACTION_VERSION,
+  SERVER_COMPACTION_KIND,
+  SERVER_COMPACTION_VERSION,
+  serverCompactionMarker,
+  serverCompactionTokensBefore,
   toPiUsage,
+  updateServerCompactionCapture,
   type RemoteCompactionDetails,
+  type ServerCompactionCapture,
+  type ServerCompactionDetails,
   resolveCompactUrl,
 } from "../src/remote-compaction.ts";
 import {
@@ -92,7 +104,17 @@ const CODEX_FAST_MODE_STATUS = "pi-codex-fast-mode";
 const compactionPatchMarker: unique symbol = Symbol.for(
   "pi-codex.provider-compaction-threshold.v1",
 ) as any;
+const DEFAULT_LOCAL_COMPACTION_RESERVE_TOKENS = 16_384;
 let activeCodexContextWindow: number | undefined;
+// Server-side compaction supplies its own checkpoint, so Pi's local threshold
+// must not preempt it. `getCompactionSettings` returns reserve 0 for the active
+// openai Responses model; the original reserve is retained for local
+// summarization (manual /compact and overflow fallback), which still needs a
+// usable output budget.
+let activeServerCompactionKey: string | undefined;
+let serverCompactionAppendAvailable = true;
+let configuredServerCompactionReserveTokens = DEFAULT_LOCAL_COMPACTION_RESERVE_TOKENS;
+let serverCompactionAppendWarningEmitted = false;
 
 type PatchedSettingsPrototype = SettingsManager & {
   [compactionPatchMarker]?: true;
@@ -188,12 +210,44 @@ function formatWorkingElapsed(elapsedMs: number): string {
   return `${hours}h ${minutes % 60}m`;
 }
 
+/**
+ * Track which connection owns compaction thresholds for the selected model.
+ * The optional base URL is the provider-auth override; callers that only have
+ * the model fall back to `model.baseUrl`.
+ */
+function updateServerCompactionState(
+  model: Model<any> | undefined,
+  providerBaseUrl?: string,
+): boolean {
+  const enabled =
+    serverCompactionAppendAvailable &&
+    isOpenAIServerCompactionModel(model, providerBaseUrl);
+  activeServerCompactionKey = enabled && model ? `${model.provider}/${model.id}` : undefined;
+  return enabled;
+}
+
+function isActiveServerCompactionModel(
+  model: Pick<Model<any>, "provider" | "id"> | undefined,
+): boolean {
+  if (activeServerCompactionKey === undefined) return false;
+  if (!model) return true;
+  return `${model.provider}/${model.id}` === activeServerCompactionKey;
+}
+
 function installCodexCompactionThreshold() {
   const prototype = SettingsManager.prototype as PatchedSettingsPrototype;
   if (prototype[compactionPatchMarker]) return;
 
   const original = SettingsManager.prototype.getCompactionSettings;
-  SettingsManager.prototype.getCompactionSettings = function () {
+  SettingsManager.prototype.getCompactionSettings = function (model) {
+    if (isActiveServerCompactionModel(model)) {
+      const settings = original.call(this, model);
+      // Pi checks `contextTokens > window - reserve` before dispatching. A zero
+      // reserve makes the server's 90% threshold win the crossing request; the
+      // only local trigger left is a genuine overflow, which is the backstop.
+      configuredServerCompactionReserveTokens = settings.reserveTokens;
+      return { ...settings, reserveTokens: 0 };
+    }
     const settings = original.call(this);
     if (!activeCodexContextWindow) return settings;
     return {
@@ -585,10 +639,69 @@ export default function piCodex(pi: ExtensionAPI) {
       ?.details as RemoteCompactionDetails | undefined;
   }
 
+  function latestServerCompaction(ctx: { sessionManager: { getBranch(): readonly any[] } }) {
+    return [...ctx.sessionManager.getBranch()]
+      .reverse()
+      .find((entry: any) => entry.type === "compaction" && isServerCompactionDetails(entry.details))
+      ?.details as ServerCompactionDetails | undefined;
+  }
+
+  async function resolveProviderBaseUrl(
+    ctx: any,
+    model: Model<any>,
+  ): Promise<string | undefined> {
+    try {
+      const providerAuth = await ctx?.modelRegistry?.getProviderAuth?.(model.provider);
+      return providerAuth?.auth?.baseUrl ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function refreshServerCompactionState(ctx: any, model: Model<any> | undefined) {
+    // Only resolve provider auth for the one built-in connection this path can
+    // serve. Session start and model switch must not trigger auth refreshes for
+    // unrelated providers.
+    if (!isServerCompactionCandidate(model)) {
+      updateServerCompactionState(undefined);
+      return;
+    }
+    const providerBaseUrl = await resolveProviderBaseUrl(ctx, model);
+    updateServerCompactionState(model, providerBaseUrl);
+  }
+
+  function serverCompactionEnabled(): boolean {
+    try {
+      const settings =
+        typeof pi.getSettings === "function" ? pi.getSettings() : undefined;
+      return settings?.compaction?.enabled ?? true;
+    } catch {
+      return true;
+    }
+  }
+
+  function hasServerCompactionAppend(ctx: any): boolean {
+    return typeof ctx?.sessionManager?.appendCompaction === "function";
+  }
+
+  function supportsServerCompactionAppend(ctx: any): boolean {
+    if (hasServerCompactionAppend(ctx)) return true;
+    if (!serverCompactionAppendWarningEmitted) {
+      serverCompactionAppendWarningEmitted = true;
+      process.stderr.write(
+        "[pi-codex] server-side compaction disabled: this pi build has no SessionManager.appendCompaction (requires pi >= 1.3.0)\n",
+      );
+    }
+    return false;
+  }
+
+  let serverCompactionCapture: ServerCompactionCapture | undefined;
+
   function syncTools(model: Model<any> | undefined) {
     activeCodexContextWindow = isOpenAICodexModel(model)
       ? model?.contextWindow
       : undefined;
+    updateServerCompactionState(model);
     const active = new Set(pi.getActiveTools());
     applyPatchSelected ??= active.has("apply_patch");
     webSearchSelected ??= active.has("web_search");
@@ -1019,7 +1132,17 @@ export default function piCodex(pi: ExtensionAPI) {
 
   pi.on("session_before_compact", async (event, ctx) => {
     const model = ctx.model;
-    if (!supportsCodexRemoteCompaction(model)) return;
+    if (!supportsCodexRemoteCompaction(model)) {
+      if (hasServerCompactionAppend(ctx) && isActiveServerCompactionModel(model)) {
+        // The server path suppresses Pi's local threshold by zeroing
+        // reserveTokens. Local summarization (manual /compact or the overflow
+        // fallback) still needs its configured output budget; restore it for
+        // this preparation only.
+        event.preparation.settings.reserveTokens =
+          configuredServerCompactionReserveTokens;
+      }
+      return;
+    }
 
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (!auth.ok || !auth.apiKey) {
@@ -1123,30 +1246,92 @@ export default function piCodex(pi: ExtensionAPI) {
     };
   });
 
-  pi.on("before_provider_request", (event, ctx) => {
-    if (!isOpenAICodexModel(ctx.model)) return;
-    if (fastModeEnabled && supportsCodexFastMode(ctx.model)) {
-      (event.payload as Record<string, unknown>).service_tier = CODEX_FAST_SERVICE_TIER;
+  pi.on("before_provider_request", async (event, ctx) => {
+    const model = ctx.model;
+    if (!model) return;
+
+    // Keep the guard result in a plain boolean: aliasing the type predicate
+    // would narrow `model` to `never` in the false branch, hiding the
+    // server-compaction branch below.
+    const codexModel =
+      model.provider === "openai-codex" || model.api === "openai-codex-responses";
+    if (codexModel) {
+      if (fastModeEnabled && supportsCodexFastMode(model)) {
+        (event.payload as Record<string, unknown>).service_tier = CODEX_FAST_SERVICE_TIER;
+      }
+      const details = latestRemoteCompaction(ctx);
+      if (details) {
+        const currentToolCatalogFingerprint = activeCodexToolFingerprint(model);
+        const input = ((event.payload as any)?.input ?? []) as readonly unknown[];
+        const expectedContextFingerprint =
+          details.contextFingerprint && details.retainedContextItemCount !== undefined
+            ? fingerprintCheckpointSuffix(
+                input,
+                checkpointMarker(details.checkpointId),
+                details.retainedContextItemCount,
+              )
+            : undefined;
+        return installRemoteCheckpoint(event.payload, details, {
+          toolCatalogFingerprint: currentToolCatalogFingerprint,
+          ...(expectedContextFingerprint
+            ? { contextFingerprint: expectedContextFingerprint }
+            : {}),
+        });
+      }
+      return;
     }
-    const details = latestRemoteCompaction(ctx);
-    if (details) {
-      const currentToolCatalogFingerprint = activeCodexToolFingerprint(ctx.model);
-      const input = ((event.payload as any)?.input ?? []) as readonly unknown[];
-      const expectedContextFingerprint =
-        details.contextFingerprint && details.retainedContextItemCount !== undefined
-          ? fingerprintCheckpointSuffix(
-              input,
-              checkpointMarker(details.checkpointId),
-              details.retainedContextItemCount,
-            )
-          : undefined;
-      return installRemoteCheckpoint(event.payload, details, {
-        toolCatalogFingerprint: currentToolCatalogFingerprint,
-        ...(expectedContextFingerprint
-          ? { contextFingerprint: expectedContextFingerprint }
-          : {}),
-      });
+
+    if (model.provider !== "openai" || model.api !== "openai-responses") return;
+    if (!isServerCompactionCandidate(model)) {
+      // Opted out at the model level; make sure a previously active server
+      // connection cannot keep suppressing local compaction.
+      serverCompactionCapture = undefined;
+      updateServerCompactionState(undefined);
+      return;
     }
+    const providerBaseUrl = await resolveProviderBaseUrl(ctx, model);
+    if (!isOpenAIServerCompactionModel(model, providerBaseUrl)) {
+      // The same model can be repointed at a proxy via provider auth. Drop the
+      // server threshold/capture state so the local path is restored.
+      serverCompactionCapture = undefined;
+      updateServerCompactionState(undefined);
+      return;
+    }
+
+    // Each provider request owns a fresh capture slot, including retries.
+    serverCompactionCapture = undefined;
+
+    if (!supportsServerCompactionAppend(ctx)) {
+      // Older pi cannot persist the opaque item, so leave local compaction
+      // (including its threshold override) untouched.
+      serverCompactionAppendAvailable = false;
+      updateServerCompactionState(undefined);
+      return;
+    }
+    serverCompactionAppendAvailable = true;
+    updateServerCompactionState(model, providerBaseUrl);
+
+    const details = latestServerCompaction(ctx);
+    if (details) installServerCompactionCheckpoint(event.payload, details);
+
+    installServerCompactionContextManagement(
+      event.payload,
+      model.contextWindow,
+      serverCompactionEnabled(),
+    );
+  });
+
+  pi.on("provider_stream_event", (event) => {
+    if (event.provider !== "openai" || event.api !== "openai-responses") return;
+    // Only fold items while the server path owns the active connection. A
+    // proxied or opted-out model can emit a compaction item of its own; it
+    // must not become a pi checkpoint because the request hook won't reinstall
+    // it.
+    if (activeServerCompactionKey === undefined) return;
+    serverCompactionCapture = updateServerCompactionCapture(
+      serverCompactionCapture,
+      event.data,
+    );
   });
 
   pi.on("before_provider_headers", (event, ctx) => {
@@ -1166,14 +1351,48 @@ export default function piCodex(pi: ExtensionAPI) {
 
   pi.on("agent_end", () => {
     retryTurnState = undefined;
+    serverCompactionCapture = undefined;
   });
   pi.on("turn_start", () => {
     retryTurnState = undefined;
     turnState = undefined;
+    serverCompactionCapture = undefined;
   });
-  pi.on("turn_end", () => {
+  pi.on("turn_end", (event, ctx) => {
     retryTurnState = undefined;
     turnState = undefined;
+    const capture = serverCompactionCapture;
+    // One append per turn: clear before writing so a failure or a second
+    // turn_end cannot commit the same item twice.
+    serverCompactionCapture = undefined;
+    if (!capture?.item) return;
+    if (!supportsServerCompactionAppend(ctx)) return;
+
+    const checkpointId = randomUUID();
+    const tokenUsage = capture.tokenUsage;
+    const details: ServerCompactionDetails = {
+      type: SERVER_COMPACTION_KIND,
+      version: SERVER_COMPACTION_VERSION,
+      checkpointId,
+      item: capture.item,
+      modelId: ctx.model?.id ?? "",
+      ...(tokenUsage ? { tokenUsage } : {}),
+    };
+    const appendCompaction = (
+      ctx.sessionManager as unknown as {
+        appendCompaction?: (...args: any[]) => unknown;
+      }
+    ).appendCompaction;
+    if (typeof appendCompaction !== "function") return;
+    appendCompaction.call(
+      ctx.sessionManager,
+      serverCompactionMarker(checkpointId),
+      event.messageEntryId,
+      serverCompactionTokensBefore(tokenUsage),
+      details,
+      true,
+      tokenUsage ? toPiUsage(tokenUsage) : undefined,
+    );
   });
   pi.on("agent_start", (_event, ctx) => {
     startWorkingTicker(ctx);
@@ -1181,19 +1400,25 @@ export default function piCodex(pi: ExtensionAPI) {
   pi.on("agent_settled", (_event, ctx) => {
     stopWorkingTicker(ctx);
   });
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     retryTurnState = undefined;
     turnState = undefined;
+    serverCompactionCapture = undefined;
+    serverCompactionAppendAvailable = hasServerCompactionAppend(ctx);
     restoreFastMode(ctx);
     syncTools(ctx.model);
+    await refreshServerCompactionState(ctx, ctx.model);
     updateFastModeStatus(ctx);
   });
-  pi.on("model_select", (event, ctx) => {
+  pi.on("model_select", async (event, ctx) => {
     syncTools(event.model);
+    await refreshServerCompactionState(ctx, event.model);
     updateFastModeStatus(ctx);
   });
   pi.on("session_shutdown", () => {
     stopWorkingTicker();
+    serverCompactionCapture = undefined;
+    updateServerCompactionState(undefined);
   });
 }
 

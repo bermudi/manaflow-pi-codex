@@ -38,6 +38,11 @@ import {
 export const REMOTE_COMPACTION_KIND = "pi-codex-remote-compaction";
 export const REMOTE_COMPACTION_VERSION = 2;
 const LEGACY_REMOTE_COMPACTION_VERSION = 1;
+export const SERVER_COMPACTION_KIND = "pi-codex-server-compaction";
+export const SERVER_COMPACTION_VERSION = 1;
+export const OPENAI_RESPONSES_BASE_URL = "https://api.openai.com/v1";
+export const MIN_SERVER_COMPACTION_THRESHOLD = 1_000;
+const SERVER_COMPACTION_THRESHOLD_FRACTION = 0.9;
 const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 const RETAINED_HISTORY_TOKEN_BUDGET = 64_000;
@@ -78,6 +83,22 @@ export interface CompactRequest {
   text: { verbosity: "low" };
 }
 
+/** A self-contained checkpoint produced by OpenAI server-side compaction. */
+export interface ServerCompactionDetails {
+  type: typeof SERVER_COMPACTION_KIND;
+  version: typeof SERVER_COMPACTION_VERSION;
+  checkpointId: string;
+  item: ResponseItem;
+  modelId: string;
+  tokenUsage?: Record<string, unknown>;
+}
+
+/** In-flight server compaction item captured from one provider stream. */
+export interface ServerCompactionCapture {
+  item?: ResponseItem;
+  tokenUsage?: Record<string, unknown>;
+}
+
 export function isRemoteCompactionDetails(value: unknown): value is RemoteCompactionDetails {
   if (!value || typeof value !== "object") return false;
   const details = value as Partial<RemoteCompactionDetails>;
@@ -101,6 +122,189 @@ export function isRemoteCompactionDetails(value: unknown): value is RemoteCompac
     (details.tokenUsage === undefined ||
       (typeof details.tokenUsage === "object" && details.tokenUsage !== null))
   );
+}
+
+export function isServerCompactionDetails(value: unknown): value is ServerCompactionDetails {
+  if (!value || typeof value !== "object") return false;
+  const details = value as Partial<ServerCompactionDetails>;
+  const item = (value as { item?: unknown }).item;
+  return (
+    details.type === SERVER_COMPACTION_KIND &&
+    details.version === SERVER_COMPACTION_VERSION &&
+    typeof details.checkpointId === "string" &&
+    details.checkpointId.length > 0 &&
+    !!item &&
+    typeof item === "object" &&
+    !Array.isArray(item) &&
+    typeof details.modelId === "string" &&
+    (details.tokenUsage === undefined ||
+      (typeof details.tokenUsage === "object" && details.tokenUsage !== null))
+  );
+}
+
+function normalizedBaseUrl(value: string | undefined): string {
+  return (value ?? "").trim().replace(/\/+$/, "");
+}
+
+/**
+ * True for the built-in `openai` provider on the Responses API, ignoring the
+ * effective base URL (which may come from provider auth). Honours the
+ * per-model opt-out; `isOpenAIServerCompactionModel` adds the base-URL check.
+ */
+export function isServerCompactionCandidate(
+  model: Model<any> | undefined,
+): model is Model<any> {
+  if (!model) return false;
+  const declared =
+    (model as any).supportsServerCompaction ??
+    (model.compat as any)?.supportsServerCompaction;
+  return (
+    declared !== false &&
+    model.provider === "openai" &&
+    model.api === "openai-responses"
+  );
+}
+
+/**
+ * True for Pi's built-in `openai` provider on the Responses API when the
+ * effective base URL is the first-party api.openai.com endpoint.
+ *
+ * This identifies the *connection* on which server-side `context_management`
+ * compaction was probed; it is not a per-model capability proof. Proxy and
+ * auth-overridden base URLs are deliberately excluded, and a model may opt out
+ * with `compat.supportsServerCompaction: false`.
+ */
+export function isOpenAIServerCompactionModel(
+  model: Model<any> | undefined,
+  providerBaseUrl?: string,
+): model is Model<any> {
+  if (!isServerCompactionCandidate(model)) return false;
+  const effective = providerBaseUrl ?? model.baseUrl;
+  return normalizedBaseUrl(effective) === OPENAI_RESPONSES_BASE_URL;
+}
+
+/**
+ * Server threshold for a context window. The API requires >= 1000 and compacts
+ * when input_tokens >= compact_threshold.
+ */
+export function serverCompactionThreshold(contextWindow: number): number {
+  const window =
+    typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0
+      ? contextWindow
+      : 0;
+  return Math.max(
+    MIN_SERVER_COMPACTION_THRESHOLD,
+    Math.floor(window * SERVER_COMPACTION_THRESHOLD_FRACTION),
+  );
+}
+
+export function serverCompactionMarker(checkpointId: string): string {
+  return `[pi-codex server compaction ${checkpointId}]`;
+}
+
+function objectValue(value: unknown): Record<string, any> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, any>)
+    : undefined;
+}
+
+function lastCompactionItem(output: unknown): ResponseItem | undefined {
+  if (!Array.isArray(output)) return undefined;
+  for (let index = output.length - 1; index >= 0; index--) {
+    const item = objectValue(output[index]);
+    if (item?.type === "compaction") return item as ResponseItem;
+  }
+  return undefined;
+}
+
+function responseUsage(event: Record<string, any>): Record<string, unknown> | undefined {
+  const usage = event.response?.usage ?? event.usage;
+  return usage && typeof usage === "object" && !Array.isArray(usage)
+    ? (usage as Record<string, unknown>)
+    : undefined;
+}
+
+/**
+ * Fold one parsed Responses stream event into the per-turn capture slot.
+ * Output-item events replace the item (the last one is authoritative);
+ * response.completed fills in the authoritative item from response.output and
+ * the usage used for `tokensBefore`.
+ */
+export function updateServerCompactionCapture(
+  capture: ServerCompactionCapture | undefined,
+  data: unknown,
+): ServerCompactionCapture | undefined {
+  const event = objectValue(data);
+  if (!event) return capture;
+
+  if (event.type === "response.output_item.done") {
+    const item = objectValue(event.item);
+    if (item?.type !== "compaction") return capture;
+    return { ...capture, item: item as ResponseItem };
+  }
+
+  if (event.type !== "response.completed") return capture;
+  const completedItem = lastCompactionItem(event.response?.output);
+  const tokenUsage = responseUsage(event);
+  if (!completedItem && !tokenUsage) return capture;
+  return {
+    ...capture,
+    ...(completedItem ? { item: completedItem } : {}),
+    ...(tokenUsage ? { tokenUsage } : {}),
+  };
+}
+
+export function serverCompactionTokensBefore(
+  tokenUsage: Record<string, unknown> | undefined,
+): number {
+  if (!tokenUsage) return 0;
+  return (
+    numeric(tokenUsage.input_tokens ?? tokenUsage.inputTokens) ||
+    numeric(tokenUsage.total_tokens ?? tokenUsage.totalTokens)
+  );
+}
+
+/**
+ * Add server-side compaction to a Responses request unless the caller already
+ * supplied context_management or compaction is disabled.
+ */
+export function installServerCompactionContextManagement(
+  payload: unknown,
+  contextWindow: number,
+  enabled = true,
+): unknown {
+  if (!enabled || !payload || typeof payload !== "object") return payload;
+  const body = payload as Record<string, unknown>;
+  if (Object.hasOwn(body, "context_management")) return payload;
+  body.context_management = [
+    { type: "compaction", compact_threshold: serverCompactionThreshold(contextWindow) },
+  ];
+  return payload;
+}
+
+/**
+ * Replace the persisted marker with the opaque server item. The marker must
+ * occur exactly once, both across input items and inside the matched item;
+ * anything else is treated as a stale or unrelated request and left untouched.
+ */
+export function installServerCompactionCheckpoint(
+  payload: unknown,
+  details: ServerCompactionDetails,
+): unknown {
+  if (!payload || typeof payload !== "object") return payload;
+  const item = (details as { item?: unknown }).item;
+  if (!item || typeof item !== "object" || Array.isArray(item)) return payload;
+  const body = payload as { input?: unknown[] };
+  if (!Array.isArray(body.input)) return payload;
+  const marker = serverCompactionMarker(details.checkpointId);
+  const matchingIndexes = body.input.flatMap((entry, index) =>
+    itemContainsMarker(entry, marker) ? [index] : [],
+  );
+  if (matchingIndexes.length !== 1) return payload;
+  const index = matchingIndexes[0];
+  if (markerCount(body.input[index], marker) !== 1) return payload;
+  body.input.splice(index, 1, details.item);
+  return payload;
 }
 
 export function fingerprintContext(items: readonly ResponseItem[]): string {

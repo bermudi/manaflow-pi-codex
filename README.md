@@ -109,9 +109,27 @@ For every model under the `openai-codex` provider, `pi-codex` matches Codex's de
 
 The older `/codex/responses/compact` endpoint remains in Codex for the legacy implementation, but it is not the default in the inspected upstream revision. There is no additional compaction-specific subrouter path: both normal and compaction V2 traffic use the resolved base URL's `/backend-api/codex/responses` route.
 
-Remote compaction is intentionally limited to the `openai-codex` provider. Other providers retain pi's normal local summary compaction.
+Remote compaction is intentionally limited to the `openai-codex` provider. The built-in `openai` provider's Responses connection uses the server-side compaction flow below; all other providers retain pi's normal local summary compaction.
 
-The package targets Pi 0.84 APIs. It does not attempt to reproduce Codex's
+## Server-side compaction (openai connection)
+
+For pi's built-in `openai` provider using the Responses API (`api: "openai-responses"`) at the first-party `https://api.openai.com/v1` base URL, `pi-codex` asks OpenAI to compact the conversation server-side instead of letting pi's local summary run first:
+
+- Each request carries `context_management: [{ "type": "compaction", "compact_threshold": <90% of the model context window> }]` unless the request already has `context_management`. The threshold is floored and clamped to the API minimum of 1000; a 272,000-token window uses 244,800.
+- The final compaction item from the response stream (`response.output_item.done`, falling back to the last compaction item in `response.completed`) is persisted as a `pi-codex-server-compaction` checkpoint together with its token usage. Later requests replace the checkpoint marker in the input with that opaque item exactly once; missing, duplicated, or stale markers are ignored.
+- pi's local compaction threshold is suppressed for this connection by returning `reserveTokens: 0` from the in-memory settings patch, so the server's 90% threshold gets the crossing request. Overflow recovery still force-compacts because it is independent of the reserve; the configured reserve is restored for that local summary path.
+
+`/compact` on this connection remains pi-local summarization. The extension restores the configured reserve for that path so the local summary has a usable output budget.
+
+Caveats:
+
+- The context meter under-reports the effective context after a server compaction: pi sees the marker/opaque item, not the server's compressed token count.
+- Server items are tied to the model and account that produced them. Switching models after a server compaction is not supported by this path; start a new session or compact locally.
+- Proxy or auth-overridden base URLs (anything other than `https://api.openai.com/v1`) skip server compaction. A model may opt out with `compat.supportsServerCompaction: false`.
+- API-key mode is assumed to have the same Responses behavior as OAuth, but that path has not been live-tested.
+- Requires a pi build with `SessionManager.appendCompaction` (pi 1.3+). Without it the extension logs one notice and leaves the request untouched.
+
+The package targets pi's extension APIs and is developed against Pi 1.3. It does not attempt to reproduce Codex's
 subagent tool surface yet. First-class namespace routing, model-owned tool
 search dispatch, and provider response continuation remain Pi core concerns.
 Deferred contracts therefore stay out of the initial model-visible tool list,

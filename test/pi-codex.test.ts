@@ -1492,7 +1492,9 @@ test("second standalone call refreshes its own header after completing", async (
   const { ToolExecutionComponent } = await import(
     "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js"
   );
-  initTheme(undefined, false);
+  // Pi 1.3's "system" theme leaves tool panel backgrounds transparent when the
+  // terminal reports no colors, so use a concrete theme to observe the repaint.
+  initTheme("dark", false);
 
   const tools = new Map<string, any>();
   const handlers = new Map<string, Array<(...args: any[]) => unknown>>();
