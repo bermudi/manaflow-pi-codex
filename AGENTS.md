@@ -81,6 +81,18 @@ Releasing is a **tag push**, not a local `npm publish`:
    installs when he chooses. The fake-HOME managed-root *simulation* in
    Verification is unaffected.
 
+## Server compaction capture
+
+Pi's cache warmer replays a request with `maxTokens: 1` and the original
+`onPayload`/`onProviderStreamEvent` callbacks while a foreground response may
+still be streaming. Capture must be keyed by `response.completed.response.id`
+and committed from `turn_end` only when it matches the assistant message's
+`responseId`; a request hook invocation is not evidence of a foreground
+request. Do not attach response usage to the resulting compaction entry (the
+assistant message already carries it), and do not commit a checkpoint for a
+truncated (`stopReason: "length"`) response before pi's recoverable-length
+recovery runs.
+
 ## Conventions
 
 - Node ≥ 22.19, ESM, TypeScript strict (`npm run check`).

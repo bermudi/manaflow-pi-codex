@@ -1247,8 +1247,11 @@ test("persists one server checkpoint per turn and clears it at every boundary", 
   assert.equal(firstCommit.details.item.id, "cmp_1");
   assert.equal(firstCommit.details.modelId, "gpt-6-sol");
   assert.deepEqual(firstCommit.details.tokenUsage, usage);
-  assert.equal(firstCommit.usage.input, 8_689);
-  assert.equal(firstCommit.usage.output, 20);
+  assert.equal(
+    firstCommit.usage,
+    undefined,
+    "response usage is already on the assistant message; compaction entries must not count it twice",
+  );
 
   // A second turn_end without a capture must not commit again.
   assert.equal(commit("assistant-entry-1"), undefined);
@@ -1285,6 +1288,166 @@ test("persists one server checkpoint per turn and clears it at every boundary", 
   });
   const retried = compactionDraft(commit("assistant-entry-3"));
   assert.equal(retried.details.item.id, "cmp_2");
+});
+
+test("a cache-warming replay cannot replace the foreground checkpoint", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel());
+  const request = handlers.get("before_provider_request")!;
+  const streamEvent = handlers.get("provider_stream_event")!;
+  const turnStart = handlers.get("turn_start")!;
+  const turnEnd = handlers.get("turn_end")!;
+
+  const foreground = { type: "compaction", id: "cmp_fg", encrypted_content: "fg" };
+  const warming = { type: "compaction", id: "cmp_warm", encrypted_content: "warm" };
+  const foregroundUsage = { input_tokens: 10_100, output_tokens: 20 };
+  const warmingUsage = { input_tokens: 9_000, output_tokens: 1 };
+  const stream = (data: any) =>
+    streamEvent({
+      provider: "openai",
+      api: "openai-responses",
+      model: "gpt-6-sol",
+      data,
+    });
+
+  turnStart({ turnIndex: 1, timestamp: 1 });
+  // The foreground response emits its checkpoint, then pi's cache warmer
+  // replays the request with a one-token cap while the foreground stream is
+  // still running. The warming request passes through before_provider_request
+  // and emits its own checkpoint and terminal event.
+  await request({ payload: { input: [], max_output_tokens: 128_000 } }, ctx);
+  stream({
+    type: "response.output_item.done",
+    item: foreground,
+  });
+  await request({ payload: { input: [], max_output_tokens: 16 } }, ctx);
+  stream({
+    type: "response.created",
+    response: { id: "resp_warm", max_output_tokens: 16, output: [] },
+  });
+  stream({
+    type: "response.output_item.done",
+    item: warming,
+  });
+  stream({
+    type: "response.completed",
+    response: { id: "resp_warm", output: [warming], usage: warmingUsage },
+  });
+  stream({
+    type: "response.completed",
+    response: { id: "resp_fg", output: [foreground], usage: foregroundUsage },
+  });
+  // A warming stream that already sent response.created before the foreground
+  // finished must not append its later output item to the completed foreground
+  // capture by inheriting that capture's response id.
+  stream({
+    type: "response.output_item.done",
+    item: warming,
+  });
+  // A warming stream that started late must not overwrite the completed
+  // foreground entry with its own output item before it finishes.
+  stream({
+    type: "response.created",
+    response: { id: "resp_warm_late" },
+  });
+  stream({
+    type: "response.output_item.done",
+    item: warming,
+  });
+  // The warmer may also finish after the foreground response; its late
+  // terminal event must not become the turn's checkpoint.
+  stream({
+    type: "response.completed",
+    response: { id: "resp_warm_2", output: [warming], usage: warmingUsage },
+  });
+
+  const result = turnEnd(
+    {
+      entries: [],
+      messageEntryId: "assistant-fg",
+      message: {
+        role: "assistant",
+        responseId: "resp_fg",
+        stopReason: "stop",
+        content: [],
+      },
+      toolResults: [],
+    },
+    ctx,
+  );
+  const compactionDraft = result.entries.find(
+    (entry: any) => entry.type === "compaction",
+  );
+  assert.equal(compactionDraft.details.item.id, "cmp_fg");
+  assert.deepEqual(compactionDraft.details.tokenUsage, foregroundUsage);
+  assert.equal(compactionDraft.usage, undefined);
+});
+
+test("turn_end leaves truncated responses to pi's recovery path", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel());
+  const request = handlers.get("before_provider_request")!;
+  const streamEvent = handlers.get("provider_stream_event")!;
+  const turnStart = handlers.get("turn_start")!;
+  const turnEnd = handlers.get("turn_end")!;
+
+  const item = { type: "compaction", id: "cmp_truncated", encrypted_content: "opaque" };
+  const stream = (data: any) =>
+    streamEvent({
+      provider: "openai",
+      api: "openai-responses",
+      model: "gpt-6-sol",
+      data,
+    });
+
+  turnStart({ turnIndex: 1, timestamp: 1 });
+  await request({ payload: { input: [] } }, ctx);
+  stream({ type: "response.output_item.done", item });
+  stream({
+    type: "response.completed",
+    response: {
+      id: "resp_truncated",
+      output: [item],
+      usage: { input_tokens: 10_100, output_tokens: 128_000 },
+    },
+  });
+
+  // Pi has not yet run its post-run recoverable-length check. Committing a
+  // compaction entry here would make the assistant message look older than the
+  // new boundary and suppress that check.
+  const result = turnEnd(
+    {
+      entries: [],
+      messageEntryId: "assistant-truncated",
+      message: {
+        role: "assistant",
+        responseId: "resp_truncated",
+        stopReason: "length",
+        content: [{ type: "text", text: "partial output" }],
+      },
+      toolResults: [],
+    },
+    ctx,
+  );
+  assert.equal(result, undefined);
+
+  // The aborted commit path cleared the capture: a later successful turn_end
+  // must not commit the truncated response's checkpoint.
+  const later = turnEnd(
+    {
+      entries: [],
+      messageEntryId: "assistant-next",
+      message: {
+        role: "assistant",
+        responseId: "resp_truncated",
+        stopReason: "stop",
+        content: [],
+      },
+      toolResults: [],
+    },
+    ctx,
+  );
+  assert.equal(later, undefined);
 });
 
 test("turn_end trims pre-checkpoint assistant output but keeps tool results", async () => {

@@ -130,6 +130,12 @@ export interface ServerCompactionDetails {
 
 /** In-flight server compaction item captured from one provider stream. */
 export interface ServerCompactionCapture {
+  /**
+   * Provider response that produced this capture, once `response.completed`
+   * identifies it. Cache-warming requests replay the same callbacks, so a
+   * capture without an id must never be attributed to the foreground turn.
+   */
+  responseId?: string;
   item?: ResponseItem;
   tokenUsage?: Record<string, unknown>;
   /**
@@ -332,6 +338,13 @@ export function updateServerCompactionCapture(
   const event = objectValue(data);
   if (!event) return capture;
 
+  if (event.type === "response.created") {
+    // A stream starts fresh. Completed captures are retained by the caller's
+    // per-response map; anything still in this slot belongs to the stream that
+    // just ended and must not absorb output items from the new one.
+    return undefined;
+  }
+
   if (event.type === "response.output_item.added") {
     return countAssistantContent(capture, event);
   }
@@ -351,12 +364,24 @@ export function updateServerCompactionCapture(
   }
 
   if (event.type !== "response.completed") return capture;
-  const output = Array.isArray(event.response?.output)
-    ? (event.response.output as unknown[])
+  const response = objectValue(event.response);
+  const output = Array.isArray(response?.output)
+    ? (response.output as unknown[])
     : undefined;
   const completedItem = lastCompactionItem(output);
   const tokenUsage = responseUsage(event);
-  if (!completedItem && !tokenUsage) return capture;
+  const responseId =
+    typeof response?.id === "string" && response.id.length > 0
+      ? response.id
+      : undefined;
+  if (!completedItem && !tokenUsage && responseId === undefined) return capture;
+  // A completion for a different response must not inherit the previous
+  // stream's item or boundary. Cache warming replays the same callbacks while
+  // the foreground response is still streaming, so its terminal event can
+  // otherwise overwrite the foreground capture wholesale.
+  const sameResponse =
+    capture?.responseId === undefined || capture.responseId === responseId;
+  const previous = sameResponse ? capture : undefined;
   const completedIndex = output ? lastCompactionIndex(output) : -1;
   const completedContentCount =
     output && completedIndex >= 0
@@ -365,13 +390,40 @@ export function updateServerCompactionCapture(
           .filter((item) => isAssistantContentOutputItem(objectValue(item))).length
       : undefined;
   return {
-    ...capture,
+    ...previous,
+    ...(responseId !== undefined ? { responseId } : {}),
     ...(completedItem ? { item: completedItem } : {}),
     ...(completedContentCount !== undefined
       ? { contentCountBefore: completedContentCount }
       : {}),
     ...(tokenUsage ? { tokenUsage } : {}),
   };
+}
+
+/**
+ * True for the terminal Responses event that carries the authoritative output
+ * list and usage for one successful provider response.
+ */
+export function isProviderResponseCompleted(data: unknown): boolean {
+  return objectValue(data)?.type === "response.completed";
+}
+
+/**
+ * Select the capture belonging to the foreground assistant response.
+ *
+ * Cache-warming requests replay the same stream callbacks as the real request,
+ * so captures are stored per provider response id. A host that does not record
+ * the response id on the assistant message may only commit when exactly one
+ * response was captured; anything else is ambiguous and is left uncommitted
+ * rather than risking the wrong checkpoint on the foreground message.
+ */
+export function selectServerCompactionCapture(
+  captures: ReadonlyMap<string, ServerCompactionCapture>,
+  responseId: string | undefined,
+): ServerCompactionCapture | undefined {
+  if (captures.size === 0) return undefined;
+  if (responseId !== undefined) return captures.get(responseId);
+  return captures.size === 1 ? captures.values().next().value : undefined;
 }
 
 /**

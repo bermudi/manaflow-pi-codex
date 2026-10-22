@@ -33,6 +33,7 @@ import {
   installServerCompactionCheckpoint,
   installServerCompactionContextManagement,
   isOpenAIServerCompactionModel,
+  isProviderResponseCompleted,
   isRemoteCompactionDetails,
   isServerCompactionCandidate,
   isServerCompactionDetails,
@@ -42,6 +43,7 @@ import {
   prependServerCompactionCheckpoint,
   retainedContextItems,
   REMOTE_COMPACTION_VERSION,
+  selectServerCompactionCapture,
   SERVER_COMPACTION_KIND,
   SERVER_COMPACTION_VERSION,
   serverCompactionMarker,
@@ -769,9 +771,19 @@ export default function piCodex(pi: ExtensionAPI) {
   }
 
   let serverCompactionCapture: ServerCompactionCapture | undefined;
+  // Captures keyed by provider response id. Cache warming replays the original
+  // request callbacks, so a single slot can be overwritten by a warming stream
+  // while the foreground response is still running; turn_end picks the capture
+  // whose response id matches the foreground assistant message.
+  const serverCompactionCaptures = new Map<string, ServerCompactionCapture>();
+
+  function clearServerCompactionCapture() {
+    serverCompactionCapture = undefined;
+    serverCompactionCaptures.clear();
+  }
 
   function clearServerCompactionState() {
-    serverCompactionCapture = undefined;
+    clearServerCompactionCapture();
     updateServerCompactionState(undefined);
   }
 
@@ -1411,8 +1423,9 @@ export default function piCodex(pi: ExtensionAPI) {
       // repaired checkpoint but no context_management.
       const compactionEnabled = serverCompactionEnabled();
 
-      // Each provider request owns a fresh capture slot, including retries.
-      serverCompactionCapture = undefined;
+      // Do not reset the capture slot here. Cache warming replays this hook
+      // while a foreground response may still be streaming; clearing it would
+      // discard that response's checkpoint.
       serverCompactionAppendAvailable = true;
       updateServerCompactionState(model, providerBaseUrl);
 
@@ -1437,10 +1450,23 @@ export default function piCodex(pi: ExtensionAPI) {
     // must not become a pi checkpoint because the request hook won't reinstall
     // it.
     if (activeServerCompactionKey === undefined) return;
-    serverCompactionCapture = updateServerCompactionCapture(
+    const capture = updateServerCompactionCapture(
       serverCompactionCapture,
       event.data,
     );
+    if (capture?.item) {
+      // Store by provider response id. A warming response has its own id and
+      // therefore cannot replace or be selected as the foreground capture.
+      // The empty key is the legacy host fallback for streams that never
+      // expose an id; turn_end only uses it when it is unambiguous.
+      serverCompactionCaptures.set(capture.responseId ?? "", capture);
+    }
+    // `response.completed` is terminal. Keep the finalized capture in the map
+    // and start a fresh slot, so output items from a late cache-warming stream
+    // cannot mutate the foreground entry by spreading its response id.
+    serverCompactionCapture = isProviderResponseCompleted(event.data)
+      ? undefined
+      : capture;
   });
 
   pi.on("before_provider_headers", (event, ctx) => {
@@ -1460,20 +1486,44 @@ export default function piCodex(pi: ExtensionAPI) {
 
   pi.on("agent_end", () => {
     retryTurnState = undefined;
-    serverCompactionCapture = undefined;
+    clearServerCompactionCapture();
   });
   pi.on("turn_start", () => {
     retryTurnState = undefined;
     turnState = undefined;
-    serverCompactionCapture = undefined;
+    clearServerCompactionCapture();
   });
   pi.on("turn_end", (event, ctx) => {
     retryTurnState = undefined;
     turnState = undefined;
-    const capture = serverCompactionCapture;
+    const message = event.message as {
+      content?: unknown;
+      responseId?: unknown;
+      stopReason?: unknown;
+    };
+    const responseId =
+      typeof message.responseId === "string" && message.responseId.length > 0
+        ? message.responseId
+        : undefined;
+    const capture = selectServerCompactionCapture(
+      serverCompactionCaptures,
+      responseId,
+    );
     // One commit per turn: clear before returning drafts so a failure or a
     // second turn_end cannot commit the same item twice.
-    serverCompactionCapture = undefined;
+    clearServerCompactionCapture();
+    // Truncated or failed responses still need pi's post-run recovery path.
+    // Committing a checkpoint first makes the new compaction entry newer than
+    // the assistant message, which suppresses `_checkCompaction()` before its
+    // recoverable-length handling can run.
+    const stopReason = message.stopReason;
+    if (
+      stopReason !== undefined &&
+      stopReason !== "stop" &&
+      stopReason !== "toolUse"
+    ) {
+      return;
+    }
     if (!capture?.item) return;
     if (!supportsServerCompactionAppend(ctx)) return;
 
@@ -1515,13 +1565,15 @@ export default function piCodex(pi: ExtensionAPI) {
       // result would discard conversation content the checkpoint never saw.
     }
 
-    const piUsage = tokenUsage ? toPiUsage(tokenUsage) : undefined;
     entries.push({
       type: "compaction",
       summary: serverCompactionMarker(checkpointId),
       firstKeptEntryId: event.messageEntryId,
       details,
-      ...(piUsage ? { usage: piUsage } : {}),
+      // This usage belongs to the assistant response that carried the
+      // checkpoint and is already recorded on its message. Pi independently
+      // totals assistant-message and compaction-entry usage, so attaching it
+      // here would double-count the request. Keep it in `details.tokenUsage`.
     });
     return { entries };
   });
