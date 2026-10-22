@@ -80,6 +80,15 @@ Releasing is a **tag push**, not a local `npm publish`:
    root (`~/.pi/agent/npm`). Report the published version and stop — he
    installs when he chooses. The fake-HOME managed-root *simulation* in
    Verification is unaffected.
+6. **`npm view` lags the publish; the registry does not.** Right after a tag
+   run the local packument cache can still report `latest` = previous version,
+   or E404 the new one, while the package is already live — `npm pack
+   @bermudi/pi-codex@<new>` succeeds in the same breath. Do not call a publish
+   failed on that. Confirm against the registry itself
+   (`curl -sS https://registry.npmjs.org/@bermudi%2Fpi-codex | jq '.["dist-tags"]'`)
+   and re-query with `--prefer-online`. Verify `dist.gitHead` equals the release
+   commit, then install the *published* tarball into a fake HOME and boot it —
+   the published artifact, not the local `npm pack`, is the thing users get.
 
 ## Server compaction capture
 
