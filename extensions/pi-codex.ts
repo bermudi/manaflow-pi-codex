@@ -165,22 +165,24 @@ function installCompactCompactionRenderer() {
   Object.defineProperty(prototype, compactRendererMarker, { value: true });
 }
 
-function isOpenAICodexModel(model: Model<any> | undefined): model is Model<any> {
+function isOpenAICodexModel(model: Model<any> | undefined): boolean {
   // Codex-compatible providers can be local/subrouter aliases while still
   // speaking the OpenAI Responses protocol. This controls Codex tool behavior;
   // remote compaction has a narrower capability check below.
   return model?.provider === "openai-codex" || model?.api === "openai-codex-responses";
 }
 
-function supportsCodexRemoteCompaction(
-  model: Model<any> | undefined,
-): model is Model<any> {
+function isOpenAIResponsesModel(model: Model<any> | undefined): boolean {
+  return model?.provider === "openai" && model?.api === "openai-responses";
+}
+
+function supportsCodexRemoteCompaction(model: Model<any> | undefined): boolean {
   if (!isOpenAICodexModel(model)) return false;
   const declared =
     (model as any).supportsRemoteCompaction ??
-    (model.compat as any)?.supportsRemoteCompaction;
+    (model?.compat as any)?.supportsRemoteCompaction;
   if (typeof declared === "boolean") return declared;
-  return model.provider === "openai-codex" || model.provider === "subrouter";
+  return model?.provider === "openai-codex" || model?.provider === "subrouter";
 }
 
 function isCodexSolModel(model: Model<any> | undefined): boolean {
@@ -678,6 +680,29 @@ export default function piCodex(pi: ExtensionAPI) {
     return undefined;
   }
 
+  // Server checkpoints are opaque items produced by one model on the openai
+  // Responses connection; replaying them under a different model or on a
+  // different connection is not supported (README). The repair above still
+  // carries the checkpoint on openai Responses payloads, so the documented
+  // failure mode becomes visible instead of silent: one stderr notice per
+  // checkpoint, per session.
+  const serverCompactionCheckpointWarnings = new Set<string>();
+
+  function warnServerCompactionCheckpointMismatch(
+    model: Model<any>,
+    details: ServerCompactionDetails,
+    repairable: boolean,
+  ) {
+    if (repairable && details.modelId === model.id) return;
+    if (serverCompactionCheckpointWarnings.has(details.checkpointId)) return;
+    serverCompactionCheckpointWarnings.add(details.checkpointId);
+    process.stderr.write(
+      repairable
+        ? `[pi-codex] server compaction checkpoint was created with ${details.modelId} but the current model is ${model.id}; server checkpoints are model-bound — switch back to ${details.modelId} or start a new session\n`
+        : `[pi-codex] server compaction checkpoint was created with ${details.modelId} on the openai Responses connection and cannot be replayed on ${model.provider}/${model.id} (${model.api}); start a new session\n`,
+    );
+  }
+
   async function resolveProviderBaseUrl(
     ctx: any,
     model: Model<any>,
@@ -694,7 +719,7 @@ export default function piCodex(pi: ExtensionAPI) {
     // Only resolve provider auth for the one built-in connection this path can
     // serve. Session start and model switch must not trigger auth refreshes for
     // unrelated providers.
-    if (!isServerCompactionCandidate(model)) {
+    if (!model || !isServerCompactionCandidate(model)) {
       updateServerCompactionState(undefined);
       return;
     }
@@ -1162,7 +1187,7 @@ export default function piCodex(pi: ExtensionAPI) {
 
   pi.on("session_before_compact", async (event, ctx) => {
     const model = ctx.model;
-    if (!supportsCodexRemoteCompaction(model)) {
+    if (!model || !supportsCodexRemoteCompaction(model)) {
       if (hasServerCompactionAppend(ctx) && isActiveServerCompactionModel(model)) {
         // The server path suppresses Pi's local threshold by zeroing
         // reserveTokens. Local summarization (manual /compact or the overflow
@@ -1280,12 +1305,28 @@ export default function piCodex(pi: ExtensionAPI) {
     const model = ctx.model;
     if (!model) return;
 
-    // Keep the guard result in a plain boolean: aliasing the type predicate
-    // would narrow `model` to `never` in the false branch, hiding the
-    // server-compaction branch below.
-    const codexModel =
-      model.provider === "openai-codex" || model.api === "openai-codex-responses";
-    if (codexModel) {
+    // Repair a persisted server checkpoint before anything capability-gated
+    // or awaited. The persisted marker is a placeholder, not a summary: a
+    // request that keeps it loses the entire pre-checkpoint conversation.
+    // Installing first means a failed auth lookup, a provider-auth proxy base
+    // URL, or a model-level opt-out can no longer send the raw marker — only
+    // *new* server compaction (context_management, threshold suppression) is
+    // gated below. Connections that cannot carry the opaque Responses item at
+    // all (Codex, other providers) are left untouched and warned once.
+    const plan = serverCompactionInstallPlan(ctx);
+    if (plan) {
+      const repairable = isOpenAIResponsesModel(model);
+      warnServerCompactionCheckpointMismatch(model, plan.details, repairable);
+      if (repairable) {
+        if (plan.mode === "replace") {
+          installServerCompactionCheckpoint(event.payload, plan.details);
+        } else {
+          prependServerCompactionCheckpoint(event.payload, plan.details);
+        }
+      }
+    }
+
+    if (isOpenAICodexModel(model)) {
       if (fastModeEnabled && supportsCodexFastMode(model)) {
         (event.payload as Record<string, unknown>).service_tier = CODEX_FAST_SERVICE_TIER;
       }
@@ -1311,7 +1352,8 @@ export default function piCodex(pi: ExtensionAPI) {
       return;
     }
 
-    if (model.provider !== "openai" || model.api !== "openai-responses") return;
+    if (!isOpenAIResponsesModel(model)) return;
+
     if (!isServerCompactionCandidate(model)) {
       // Opted out at the model level; make sure a previously active server
       // connection cannot keep suppressing local compaction.
@@ -1322,36 +1364,38 @@ export default function piCodex(pi: ExtensionAPI) {
     const providerBaseUrl = await resolveProviderBaseUrl(ctx, model);
     if (!isOpenAIServerCompactionModel(model, providerBaseUrl)) {
       // The same model can be repointed at a proxy via provider auth. Drop the
-      // server threshold/capture state so the local path is restored.
+      // server threshold/capture state so the local path is restored. The
+      // checkpoint repair above already ran, so an existing session keeps its
+      // pre-checkpoint context on the proxied connection.
       serverCompactionCapture = undefined;
       updateServerCompactionState(undefined);
       return;
     }
 
-    // Each provider request owns a fresh capture slot, including retries.
-    serverCompactionCapture = undefined;
-
     if (!supportsServerCompactionAppend(ctx)) {
       // Older pi cannot persist the opaque item, so leave local compaction
       // (including its threshold override) untouched.
       serverCompactionAppendAvailable = false;
+      serverCompactionCapture = undefined;
       updateServerCompactionState(undefined);
       return;
     }
+
+    // Read the settings before touching any state: a failed read must not
+    // leave the local threshold suppressed while server compaction is
+    // inactive. The throw propagates (runner logs it); the payload keeps the
+    // repaired checkpoint but no context_management.
+    const compactionEnabled = serverCompactionEnabled();
+
+    // Each provider request owns a fresh capture slot, including retries.
+    serverCompactionCapture = undefined;
     serverCompactionAppendAvailable = true;
     updateServerCompactionState(model, providerBaseUrl);
-
-    const plan = serverCompactionInstallPlan(ctx);
-    if (plan?.mode === "replace") {
-      installServerCompactionCheckpoint(event.payload, plan.details);
-    } else if (plan?.mode === "prepend") {
-      prependServerCompactionCheckpoint(event.payload, plan.details);
-    }
 
     installServerCompactionContextManagement(
       event.payload,
       model.contextWindow,
-      serverCompactionEnabled(),
+      compactionEnabled,
     );
   });
 
@@ -1426,14 +1470,49 @@ export default function piCodex(pi: ExtensionAPI) {
       // checkpoint, including the assistant output emitted before it. Pi has
       // already merged that output and the continuation into one assistant
       // message, so an append-only context edit retains only the continuation.
-      // Tool calls before the boundary are covered by the checkpoint; their
-      // results remain as separate entries after it.
       const retained = content.slice(splitAt);
       entries.push({
         type: "context_edit",
         targetId: event.messageEntryId,
         replacement: retained.length > 0 ? { content: retained } : null,
       });
+
+      // A tool call before the boundary is folded into the checkpoint, but its
+      // toolResult lives in a separate entry after the assistant message.
+      // Pi does not prune orphans, and the Responses converter emits
+      // function_call_output unconditionally, so a kept result would replay as
+      // an output with no matching call — which the Responses API rejects.
+      // Omit those tool-result entries from model context; results of calls at
+      // or after the boundary are untouched.
+      const droppedCallIds = new Set(
+        content
+          .slice(0, splitAt)
+          .flatMap((block: any) =>
+            block?.type === "toolCall" && typeof block.id === "string"
+              ? [block.id as string]
+              : [],
+          ),
+      );
+      if (droppedCallIds.size > 0) {
+        const toolResultEntryIds: string[] = event.toolResultEntryIds ?? [];
+        if (toolResultEntryIds.length !== event.toolResults.length) {
+          // Drafts are applied only when this handler returns normally: the
+          // checkpoint is lost, but the session keeps its full history and
+          // server compaction simply runs again. Committing with unknown
+          // orphan entry ids would corrupt the next request instead.
+          throw new Error(
+            `pi-codex: turn_end toolResultEntryIds (${toolResultEntryIds.length}) do not match toolResults (${event.toolResults.length}); refusing to commit a server checkpoint with orphaned tool results`,
+          );
+        }
+        event.toolResults.forEach((result: any, index: number) => {
+          if (!droppedCallIds.has(result.toolCallId)) return;
+          entries.push({
+            type: "context_edit",
+            targetId: toolResultEntryIds[index],
+            replacement: null,
+          });
+        });
+      }
     }
 
     const piUsage = tokenUsage ? toPiUsage(tokenUsage) : undefined;
@@ -1457,6 +1536,7 @@ export default function piCodex(pi: ExtensionAPI) {
     turnState = undefined;
     serverCompactionCapture = undefined;
     serverCompactionAppendAvailable = hasServerCompactionAppend(ctx);
+    serverCompactionCheckpointWarnings.clear();
     restoreFastMode(ctx);
     syncTools(ctx.model);
     await refreshServerCompactionState(ctx, ctx.model);

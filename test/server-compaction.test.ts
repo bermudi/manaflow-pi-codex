@@ -21,7 +21,6 @@ import {
   SERVER_COMPACTION_VERSION,
   serverCompactionMarker,
   serverCompactionThreshold,
-  serverCompactionTokensBefore,
   updateServerCompactionCapture,
   type ServerCompactionDetails,
 } from "../src/remote-compaction.ts";
@@ -112,13 +111,17 @@ function createContext(
   return { ctx, directAppends };
 }
 
-function detailsFor(checkpointId: string, item: any): ServerCompactionDetails {
+function detailsFor(
+  checkpointId: string,
+  item: any,
+  modelId = "gpt-6-sol",
+): ServerCompactionDetails {
   return {
     type: SERVER_COMPACTION_KIND,
     version: SERVER_COMPACTION_VERSION,
     checkpointId,
     item,
-    modelId: "gpt-6-sol",
+    modelId,
   };
 }
 
@@ -179,6 +182,49 @@ test("server compaction predicate identifies the first-party openai Responses co
   assert.equal(isServerCompactionCandidate(serverModel({ provider: "openai-codex" })), false);
   assert.equal(
     isServerCompactionCandidate(serverModel({ compat: { supportsServerCompaction: false } })),
+    false,
+  );
+});
+
+test("server compaction defaults to the probed gpt-6 family and needs an opt-in elsewhere", () => {
+  // Probed 2026-10-23 on the first-party connection: context_management was
+  // accepted by gpt-6-sol/luna/astra and gpt-6.1-sol. Pre-GPT-6 catalog models
+  // are rejected by that connection at the model level, so their parameter
+  // acceptance is UNVERIFIED and they stay off by default.
+  assert.equal(isServerCompactionCandidate(serverModel({ id: "gpt-6-sol" })), true);
+  assert.equal(isServerCompactionCandidate(serverModel({ id: "gpt-6-astra" })), true);
+  assert.equal(isServerCompactionCandidate(serverModel({ id: "gpt-6-luna" })), true);
+  assert.equal(isServerCompactionCandidate(serverModel({ id: "gpt-6.1-sol" })), true);
+  assert.equal(isServerCompactionCandidate(serverModel({ id: "gpt-6" })), true);
+
+  assert.equal(isServerCompactionCandidate(serverModel({ id: "gpt-5.1" })), false);
+  assert.equal(isServerCompactionCandidate(serverModel({ id: "gpt-5.3-codex" })), false);
+  assert.equal(isServerCompactionCandidate(serverModel({ id: "gpt-4.1" })), false);
+  assert.equal(isServerCompactionCandidate(serverModel({ id: "o3" })), false);
+  // The family match is anchored: gpt-daybreak/gpt-6x must not sneak in.
+  assert.equal(
+    isServerCompactionCandidate(serverModel({ id: "gpt-daybreak-blue-latest" })),
+    false,
+  );
+  assert.equal(isServerCompactionCandidate(serverModel({ id: "gpt-60" })), false);
+
+  // Explicit opt-in enables an unprobed model; explicit opt-out wins everywhere.
+  assert.equal(
+    isServerCompactionCandidate(
+      serverModel({ id: "gpt-4.1", compat: { supportsServerCompaction: true } }),
+    ),
+    true,
+  );
+  assert.equal(
+    isServerCompactionCandidate(
+      serverModel({ id: "gpt-4.1", supportsServerCompaction: true }),
+    ),
+    true,
+  );
+  assert.equal(
+    isServerCompactionCandidate(
+      serverModel({ id: "gpt-6-sol", supportsServerCompaction: false }),
+    ),
     false,
   );
 });
@@ -322,6 +368,102 @@ test("server checkpoint replacement works through pi's compaction projection", a
   assert.equal((payload.input[1] as any).role, "assistant");
   assert.match(JSON.stringify(payload.input[1]), /retained tail/);
   assert.doesNotMatch(JSON.stringify(payload.input), /before the checkpoint/);
+});
+
+test("a committed server checkpoint drops orphaned tool results from the next request", async () => {
+  const { convertResponsesMessages } = await import(
+    "../src/vendor/openai-responses-shared.mjs"
+  );
+  const session = SessionManager.inMemory("/tmp/pi-codex-orphan-tool-result-test");
+  const timestamp = Date.now();
+  session.appendMessage({
+    role: "user",
+    content: [{ type: "text", text: "run commands" }],
+    timestamp,
+  } as any);
+  const assistantId = session.appendMessage({
+    role: "assistant",
+    content: [
+      { type: "text", text: "before the checkpoint" },
+      {
+        type: "toolCall",
+        id: "call_1|fc_1",
+        name: "bash",
+        arguments: { command: "ls" },
+      },
+      { type: "text", text: "after the checkpoint" },
+      {
+        type: "toolCall",
+        id: "call_2|fc_2",
+        name: "bash",
+        arguments: { command: "pwd" },
+      },
+    ],
+    api: "openai-responses",
+    provider: "openai",
+    model: "gpt-6-sol",
+    usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 },
+    stopReason: "toolUse",
+    timestamp: timestamp + 1,
+  } as any);
+  const firstResultId = session.appendMessage({
+    role: "toolResult",
+    toolCallId: "call_1|fc_1",
+    toolName: "bash",
+    content: [{ type: "text", text: "listing" }],
+    isError: false,
+    timestamp: timestamp + 2,
+  } as any);
+  session.appendMessage({
+    role: "toolResult",
+    toolCallId: "call_2|fc_2",
+    toolName: "bash",
+    content: [{ type: "text", text: "/tmp" }],
+    isError: false,
+    timestamp: timestamp + 3,
+  } as any);
+
+  // The drafts turn_end returns for this capture: trim the pre-checkpoint
+  // assistant prefix and omit the dropped call's tool result.
+  session.appendContextEdit(assistantId, {
+    content: [
+      { type: "text", text: "after the checkpoint" },
+      {
+        type: "toolCall",
+        id: "call_2|fc_2",
+        name: "bash",
+        arguments: { command: "pwd" },
+      },
+    ],
+  });
+  session.appendContextEdit(firstResultId, null);
+  const item = { type: "compaction", id: "cmp_orphan", encrypted_content: "opaque" };
+  session.appendCompaction(
+    serverCompactionMarker("cp-orphan"),
+    assistantId,
+    12_345,
+    detailsFor("cp-orphan", item),
+    true,
+  );
+
+  const projected = session.buildSessionProjection();
+  const input = (convertResponsesMessages as any)(
+    serverModel(),
+    { messages: convertToLlm(projected.messages) },
+    new Set(["openai"]),
+    { includeSystemPrompt: false, grammarToolInputProperties: new Map() },
+  ) as any[];
+
+  // The next request pairs one function_call with one function_call_output:
+  // the pre-checkpoint call's result is gone with its call, which the
+  // Responses API would otherwise reject as an orphaned output.
+  const calls = input.filter((entry) => entry.type === "function_call");
+  const outputs = input.filter((entry) => entry.type === "function_call_output");
+  assert.deepEqual(calls.map((call) => call.call_id), ["call_2"]);
+  assert.deepEqual(outputs.map((output) => output.call_id), ["call_2"]);
+  assert.doesNotMatch(JSON.stringify(input), /call_1/);
+  assert.doesNotMatch(JSON.stringify(input), /before the checkpoint/);
+  assert.match(JSON.stringify(input[0]), /pi-codex server compaction cp-orphan/);
 });
 
 test("an older server checkpoint survives a later local compaction", async () => {
@@ -552,12 +694,6 @@ test("stream capture tracks assistant content emitted before the latest checkpoi
   assert.equal(capture?.contentCountBefore, 1);
 });
 
-test("tokensBefore prefers input tokens and falls back to total tokens", () => {
-  assert.equal(serverCompactionTokensBefore({ input_tokens: 8_689 }), 8_689);
-  assert.equal(serverCompactionTokensBefore({ total_tokens: 9_000 }), 9_000);
-  assert.equal(serverCompactionTokensBefore(undefined), 0);
-});
-
 test("request hook installs the latest checkpoint and 90% context management", async () => {
   const { handlers } = createHarness();
   const item = { type: "compaction", id: "cmp_1", encrypted_content: "opaque" };
@@ -732,6 +868,152 @@ test("settings read failures propagate instead of enabling compaction", async ()
   );
 });
 
+test("checkpoint repair runs before every gate; only new compaction is gated", async () => {
+  const { handlers } = createHarness();
+  const item = { type: "compaction", id: "cmp_1", encrypted_content: "opaque" };
+  const marker = serverCompactionMarker("cp-1");
+  const tail = { role: "user", content: [{ type: "input_text", text: "tail" }] };
+  const branch = [
+    { type: "compaction", id: "server-entry", details: detailsFor("cp-1", item) },
+  ];
+
+  // A model-level opt-out still gets the checkpoint: the marker is a
+  // placeholder, and keeping it would drop the whole pre-checkpoint
+  // conversation. Only context_management is suppressed.
+  const optedOut = createContext(
+    serverModel({ id: "gpt-6-sol", compat: { supportsServerCompaction: false } }),
+    { branch },
+  );
+  const optedOutPayload: any = { input: [markerMessage(marker), tail] };
+  await handlers
+    .get("before_provider_request")
+    ?.({ payload: optedOutPayload }, optedOut.ctx);
+  assert.deepEqual(optedOutPayload.input, [item, tail]);
+  assert.equal(Object.hasOwn(optedOutPayload, "context_management"), false);
+
+  // Same for a provider-auth proxy base URL.
+  const proxied = createContext(
+    serverModel({ id: "gpt-6-sol" }),
+    { branch, providerBaseUrl: "https://proxy.test/v1" },
+  );
+  const proxiedPayload: any = { input: [markerMessage(marker), tail] };
+  await handlers
+    .get("before_provider_request")
+    ?.({ payload: proxiedPayload }, proxied.ctx);
+  assert.deepEqual(proxiedPayload.input, [item, tail]);
+  assert.equal(Object.hasOwn(proxiedPayload, "context_management"), false);
+
+  // A model outside the probed family defaults to no context_management but
+  // an existing checkpoint is still repaired.
+  const unprobed = createContext(serverModel({ id: "gpt-4.1" }), {
+    branch: [
+      {
+        type: "compaction",
+        id: "server-entry",
+        details: detailsFor("cp-1", item, "gpt-4.1"),
+      },
+    ],
+  });
+  const unprobedPayload: any = { input: [markerMessage(marker), tail] };
+  await handlers
+    .get("before_provider_request")
+    ?.({ payload: unprobedPayload }, unprobed.ctx);
+  assert.deepEqual(unprobedPayload.input, [item, tail]);
+  assert.equal(Object.hasOwn(unprobedPayload, "context_management"), false);
+
+  // A failed auth lookup rejects the handler, but the repair already ran:
+  // pi's runner catches the error and sends the repaired payload.
+  const authFailure = createContext(serverModel({ id: "gpt-6-sol" }), {
+    branch,
+    providerAuthError: new Error("credential refresh failed"),
+  });
+  const authFailurePayload: any = { input: [markerMessage(marker), tail] };
+  await assert.rejects(
+    () =>
+      handlers
+        .get("before_provider_request")
+        ?.({ payload: authFailurePayload }, authFailure.ctx),
+    /credential refresh failed/,
+  );
+  assert.deepEqual(authFailurePayload.input, [item, tail]);
+});
+
+test("a model switch after a server checkpoint warns once and still repairs", async () => {
+  const { handlers } = createHarness();
+  const item = { type: "compaction", id: "cmp_1", encrypted_content: "opaque" };
+  const marker = serverCompactionMarker("cp-1");
+  const tail = { role: "user", content: [{ type: "input_text", text: "tail" }] };
+  const { ctx } = createContext(serverModel({ id: "gpt-6-luna" }), {
+    branch: [
+      { type: "compaction", id: "server-entry", details: detailsFor("cp-1", item) },
+    ],
+  });
+
+  const notices: string[] = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = ((chunk: any) => {
+    notices.push(String(chunk));
+    return true;
+  }) as any;
+  try {
+    for (let index = 0; index < 2; index++) {
+      const payload: any = { input: [markerMessage(marker), tail] };
+      await handlers
+        .get("before_provider_request")
+        ?.({ payload }, ctx);
+      assert.deepEqual(payload.input, [item, tail]);
+      assert.deepEqual(payload.context_management, [
+        { type: "compaction", compact_threshold: 244_800 },
+      ]);
+    }
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+  const mismatches = notices.filter((notice) =>
+    notice.includes("created with gpt-6-sol"),
+  );
+  assert.equal(mismatches.length, 1);
+  assert.match(mismatches[0], /gpt-6-luna/);
+});
+
+test("a server checkpoint cannot be replayed on a codex connection and says so", async () => {
+  const { handlers } = createHarness();
+  const item = { type: "compaction", id: "cmp_1", encrypted_content: "opaque" };
+  const marker = serverCompactionMarker("cp-1");
+  const codexModel = {
+    id: "gpt-5.6-sol",
+    provider: "openai-codex",
+    api: "openai-codex-responses",
+    baseUrl: "https://chatgpt.com/backend-api",
+    contextWindow: 272_000,
+  } as any;
+  const { ctx } = createContext(codexModel, {
+    branch: [
+      { type: "compaction", id: "server-entry", details: detailsFor("cp-1", item) },
+    ],
+  });
+  const payload: any = { input: [markerMessage(marker)] };
+
+  const notices: string[] = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = ((chunk: any) => {
+    notices.push(String(chunk));
+    return true;
+  }) as any;
+  try {
+    await handlers.get("before_provider_request")?.({ payload }, ctx);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+  // The opaque item is not installed into a codex payload, and the failure is
+  // visible instead of silent.
+  assert.deepEqual(payload.input, [markerMessage(marker)]);
+  const notices45 = notices.filter((notice) =>
+    notice.includes("cannot be replayed on openai-codex/gpt-5.6-sol"),
+  );
+  assert.equal(notices45.length, 1);
+});
+
 test("persists one server checkpoint per turn and clears it at every boundary", async () => {
   const { handlers } = createHarness();
   const { ctx, directAppends } = createContext(serverModel());
@@ -859,6 +1141,13 @@ test("turn_end retains only output emitted after the checkpoint", async () => {
     name: "bash",
     arguments: "{}",
   };
+  const callAfter = {
+    type: "function_call",
+    call_id: "call_2",
+    id: "fc_2",
+    name: "bash",
+    arguments: "{}",
+  };
   stream({ type: "response.output_item.added", output_index: 0, item: message });
   stream({ type: "response.output_item.added", output_index: 1, item: call });
   stream({
@@ -866,20 +1155,27 @@ test("turn_end retains only output emitted after the checkpoint", async () => {
     item: { type: "compaction", id: "cmp_1", encrypted_content: "opaque" },
   });
   stream({ type: "response.output_item.added", output_index: 2, item: message });
+  stream({ type: "response.output_item.added", output_index: 3, item: callAfter });
 
   const before = { type: "text", text: "before the checkpoint" };
   const after = { type: "text", text: "after the checkpoint" };
-  const toolCall = {
+  const droppedCall = {
     type: "toolCall",
     id: "call_1|fc_1",
     name: "bash",
     arguments: { command: "ls" },
   };
+  const retainedCall = {
+    type: "toolCall",
+    id: "call_2|fc_2",
+    name: "bash",
+    arguments: { command: "pwd" },
+  };
   const result = handlers.get("turn_end")?.(
     {
       entries: [],
       messageEntryId: "assistant-1",
-      message: { role: "assistant", content: [before, toolCall, after] },
+      message: { role: "assistant", content: [before, droppedCall, after, retainedCall] },
       toolResults: [
         {
           role: "toolResult",
@@ -888,20 +1184,103 @@ test("turn_end retains only output emitted after the checkpoint", async () => {
           content: [],
           timestamp: 1,
         },
+        {
+          role: "toolResult",
+          toolCallId: "call_2|fc_2",
+          toolName: "bash",
+          content: [],
+          timestamp: 2,
+        },
       ],
+      toolResultEntryIds: ["tool-result-1", "tool-result-2"],
     },
     ctx,
   );
-  assert.equal(result.entries.length, 2);
-  assert.equal(result.entries[0].type, "context_edit");
+  assert.equal(result.entries.length, 3);
   assert.deepEqual(result.entries[0], {
     type: "context_edit",
     targetId: "assistant-1",
-    replacement: { content: [after] },
+    replacement: { content: [after, retainedCall] },
   });
-  assert.equal(result.entries[1].type, "compaction");
-  assert.equal(result.entries[1].firstKeptEntryId, "assistant-1");
-  assert.equal(result.entries[1].details.item.id, "cmp_1");
+  // The dropped tool call's result must be omitted from model context: an
+  // orphaned function_call_output makes the next Responses request 400.
+  assert.deepEqual(result.entries[1], {
+    type: "context_edit",
+    targetId: "tool-result-1",
+    replacement: null,
+  });
+  assert.equal(result.entries[2].type, "compaction");
+  assert.equal(result.entries[2].firstKeptEntryId, "assistant-1");
+  assert.equal(result.entries[2].details.item.id, "cmp_1");
+  // The retained call's result has no edit of its own.
+  assert.equal(
+    result.entries.filter(
+      (entry: any) => entry.targetId === "tool-result-2",
+    ).length,
+    0,
+  );
+});
+
+test("turn_end refuses to commit when tool result entry ids break the contract", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel());
+  await handlers
+    .get("before_provider_request")
+    ?.({ payload: { input: [] } }, ctx);
+  handlers.get("provider_stream_event")?.({
+    provider: "openai",
+    api: "openai-responses",
+    model: "gpt-6-sol",
+    data: {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "function_call", call_id: "call_1", name: "bash" },
+    },
+  });
+  handlers.get("provider_stream_event")?.({
+    provider: "openai",
+    api: "openai-responses",
+    model: "gpt-6-sol",
+    data: {
+      type: "response.output_item.done",
+      item: { type: "compaction", id: "cmp_1", encrypted_content: "opaque" },
+    },
+  });
+
+  const turnEnd = handlers.get("turn_end")!;
+  assert.throws(
+    () =>
+      turnEnd(
+        {
+          entries: [],
+          messageEntryId: "assistant-1",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "call_1|fc_1",
+                name: "bash",
+                arguments: {},
+              },
+              { type: "text", text: "after" },
+            ],
+          },
+          toolResults: [
+            {
+              role: "toolResult",
+              toolCallId: "call_1|fc_1",
+              toolName: "bash",
+              content: [],
+              timestamp: 1,
+            },
+          ],
+          toolResultEntryIds: [],
+        },
+        ctx,
+      ),
+    /toolResultEntryIds/,
+  );
 });
 
 test("turn_end omits the assistant message when the checkpoint covers all output", async () => {

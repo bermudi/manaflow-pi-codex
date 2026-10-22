@@ -1,5 +1,6 @@
 // GENERATED FILE — do not edit by hand.
-// Vendored from @earendil-works/pi-ai@0.87.0 (dist/api/openai-responses-shared.js + dependency closure).
+// Vendored from @earendil-works/pi-ai@1.3.0 (dist/api/openai-responses-shared.js + dependency closure),
+// the version bundled by @earendil-works/pi-coding-agent.
 // Regenerate with: npm run vendor
 var __create = Object.create;
 var __defProp = Object.defineProperty;
@@ -267,7 +268,7 @@ var require_dist = __commonJS({
   }
 });
 
-// node_modules/@earendil-works/pi-ai/dist/utils/text.js
+// node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/utils/text.js
 function contentText(content, separator = "\n") {
   if (typeof content === "string")
     return content;
@@ -294,7 +295,7 @@ ${value}`);
   return parts.join("\n\n");
 }
 
-// node_modules/@earendil-works/pi-ai/dist/utils/transcript.js
+// node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/utils/transcript.js
 function isSystemMessage(message) {
   return message.role === "system";
 }
@@ -374,7 +375,7 @@ function resolveTranscriptTools(messages, supportsToolAdditions) {
   };
 }
 
-// node_modules/@earendil-works/pi-ai/dist/models.js
+// node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/models.js
 function calculateCost(model, usage) {
   const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
   let rates = model.cost;
@@ -395,7 +396,7 @@ function calculateCost(model, usage) {
   return usage.cost;
 }
 
-// node_modules/@earendil-works/pi-ai/dist/utils/hash.js
+// node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/utils/hash.js
 function shortHash(str) {
   let h1 = 3735928559;
   let h2 = 1103547991;
@@ -409,9 +410,9 @@ function shortHash(str) {
   return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36);
 }
 
-// node_modules/@earendil-works/pi-ai/dist/utils/json-parse.js
+// node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/utils/json-parse.js
 var import_partial_json = __toESM(require_dist(), 1);
-var VALID_JSON_ESCAPES = /* @__PURE__ */ new Set(['"', "\\", "/", "b", "f", "n", "r", "t", "u"]);
+var VALID_JSON_ESCAPES = /* @__PURE__ */ new Set(['"', "\\", "/", "b", "f", "n", "r", "t"]);
 function isControlCharacter(char) {
   const codePoint = char.codePointAt(0);
   return codePoint !== void 0 && codePoint >= 0 && codePoint <= 31;
@@ -486,6 +487,25 @@ function parseJsonWithRepair(json) {
     throw error;
   }
 }
+function parseToolCallArguments(json) {
+  if (!json?.trim())
+    return { arguments: {} };
+  try {
+    const parsed = parseJsonWithRepair(json);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("Tool arguments must be a JSON object");
+    }
+    return { arguments: parsed };
+  } catch (error) {
+    return {
+      arguments: {},
+      argumentsError: `${error instanceof Error ? error.message : String(error)}
+
+Received arguments:
+${json}`
+    };
+  }
+}
 function parseStreamingJson(partialJson) {
   if (!partialJson || partialJson.trim() === "") {
     return {};
@@ -507,12 +527,12 @@ function parseStreamingJson(partialJson) {
   }
 }
 
-// node_modules/@earendil-works/pi-ai/dist/utils/sanitize-unicode.js
+// node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/utils/sanitize-unicode.js
 function sanitizeSurrogates(text) {
   return text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "");
 }
 
-// node_modules/@earendil-works/pi-ai/dist/api/constrained-sampling.js
+// node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/api/constrained-sampling.js
 var UnsupportedStrictJsonSchemaError = class extends Error {
 };
 var UNSUPPORTED_STRICT_SCHEMA_KEYS = [
@@ -551,13 +571,20 @@ function schemaAllowsNull(schema) {
     return true;
   return Array.isArray(schema.anyOf) && schema.anyOf.some((variant) => schemaAllowsNull(variant));
 }
-function makeJsonSchemaNodeStrict(schema) {
+function makeJsonSchemaNodeStrict(schema, isUnsupportedKeyword) {
   if (!isJsonSchemaObject(schema)) {
     throw new UnsupportedStrictJsonSchemaError("boolean schemas are unsupported");
   }
   for (const key of UNSUPPORTED_STRICT_SCHEMA_KEYS) {
     if (schema[key] !== void 0) {
       throw new UnsupportedStrictJsonSchemaError(`${key} schemas are unsupported`);
+    }
+  }
+  if (isUnsupportedKeyword) {
+    for (const [key, value] of Object.entries(schema)) {
+      if (isUnsupportedKeyword(key, value)) {
+        throw new UnsupportedStrictJsonSchemaError(`${key}: ${JSON.stringify(value)} is unsupported`);
+      }
     }
   }
   if (schema.anyOf !== void 0) {
@@ -568,14 +595,14 @@ function makeJsonSchemaNodeStrict(schema) {
       if (isStructuredSchema(variant)) {
         throw new UnsupportedStrictJsonSchemaError("object and array unions are unsupported");
       }
-      makeJsonSchemaNodeStrict(variant);
+      makeJsonSchemaNodeStrict(variant, isUnsupportedKeyword);
     }
   }
   if (schema.items !== void 0) {
     if (Array.isArray(schema.items)) {
       throw new UnsupportedStrictJsonSchemaError("tuple schemas are unsupported");
     }
-    makeJsonSchemaNodeStrict(schema.items);
+    makeJsonSchemaNodeStrict(schema.items, isUnsupportedKeyword);
   }
   const isObjectSchema = schema.type === "object";
   if (schema.properties !== void 0 && !isObjectSchema) {
@@ -599,7 +626,7 @@ function makeJsonSchemaNodeStrict(schema) {
     throw new UnsupportedStrictJsonSchemaError("required contains an unknown property");
   }
   for (const [key, property] of Object.entries(properties)) {
-    makeJsonSchemaNodeStrict(property);
+    makeJsonSchemaNodeStrict(property, isUnsupportedKeyword);
     if (!required.has(key) && !schemaAllowsNull(property)) {
       properties[key] = { anyOf: [property, { type: "null" }] };
     }
@@ -607,12 +634,12 @@ function makeJsonSchemaNodeStrict(schema) {
   schema.required = propertyNames;
   schema.additionalProperties = false;
 }
-function makeStrictJsonSchema(schema) {
+function makeStrictJsonSchema(schema, isUnsupportedKeyword) {
   const cloned = structuredClone(schema);
   if (!isJsonSchemaObject(cloned)) {
     throw new UnsupportedStrictJsonSchemaError("root schema must have type object");
   }
-  makeJsonSchemaNodeStrict(cloned);
+  makeJsonSchemaNodeStrict(cloned, isUnsupportedKeyword);
   if (cloned.type !== "object") {
     throw new UnsupportedStrictJsonSchemaError("root schema must have type object");
   }
@@ -670,13 +697,13 @@ function inferGrammarInputProperty(tool) {
   }
   return inputProperty;
 }
-function resolveJsonSchemaStrictSampling(tool, supportsStrictMode) {
+function resolveJsonSchemaStrictSampling(tool, supportsStrictMode, isUnsupportedKeyword) {
   const config = tool.constrainedSampling;
   if (!config || config.type !== "json_schema")
     return void 0;
   if (supportsStrictMode) {
     try {
-      makeStrictJsonSchema(tool.parameters);
+      makeStrictJsonSchema(tool.parameters, isUnsupportedKeyword);
       return true;
     } catch (error) {
       if (!(error instanceof UnsupportedStrictJsonSchemaError))
@@ -718,7 +745,7 @@ function resolveGrammarConstrainedSampling(tool, supportsOpenAIGrammarTools) {
   }
 }
 
-// node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js
+// node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js
 var NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 var NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
 function replaceImagesWithPlaceholder(content, placeholder) {
@@ -777,19 +804,13 @@ function transformMessages(messages, model, normalizeToolCallId) {
       const isSameModel = assistantMsg.provider === model.provider && assistantMsg.api === model.api && assistantMsg.model === model.id;
       const transformedContent = assistantMsg.content.flatMap((block) => {
         if (block.type === "thinking") {
-          if (block.redacted) {
-            return isSameModel ? block : [];
-          }
-          if (isSameModel && block.thinkingSignature)
+          if (!isSameModel)
+            return [];
+          if (block.redacted || block.thinkingSignature)
             return block;
           if (!block.thinking || block.thinking.trim() === "")
             return [];
-          if (isSameModel)
-            return block;
-          return {
-            type: "text",
-            text: block.thinking
-          };
+          return block;
         }
         if (block.type === "text") {
           if (isSameModel)
@@ -882,7 +903,7 @@ function transformMessages(messages, model, normalizeToolCallId) {
   return result;
 }
 
-// node_modules/@earendil-works/pi-ai/dist/api/openai-responses-shared.js
+// node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/api/openai-responses-shared.js
 function encodeTextSignatureV1(id, phase) {
   const payload = { v: 1, id };
   if (phase)
@@ -986,6 +1007,12 @@ function convertResponsesMessages(model, context, allowedToolCallProviders, opti
     });
   };
   const includeInitialSystemMessage = options?.includeSystemPrompt ?? true;
+  const pushConfigurationUpdate = (effort) => {
+    messages.push({
+      type: "configuration_update",
+      reasoning: { effort }
+    });
+  };
   const compat = model.compat;
   const instructionRole = model.reasoning && compat?.supportsDeveloperRole !== false ? "developer" : "system";
   let msgIndex = 0;
@@ -1065,7 +1092,8 @@ function convertResponsesMessages(model, context, allowedToolCallProviders, opti
           const [callId, itemIdRaw] = toolCall.id.split("|");
           const customInputProperty = options?.grammarToolInputProperties?.get(toolCall.name);
           let itemId = itemIdRaw;
-          if (isDifferentModel && itemId?.startsWith("fc_") || customInputProperty === void 0 && !itemId?.startsWith("fc_")) {
+          const itemIdPrefix = customInputProperty === void 0 ? "fc_" : "ctc_";
+          if (isDifferentModel || !itemId?.startsWith(itemIdPrefix)) {
             itemId = void 0;
           }
           if (customInputProperty !== void 0) {
@@ -1091,6 +1119,9 @@ function convertResponsesMessages(model, context, allowedToolCallProviders, opti
       }
       if (output.length === 0)
         continue;
+      if (options?.configurationUpdateEffort !== void 0 && isSameModel && msg.providerThinkingLevel !== void 0) {
+        pushConfigurationUpdate(msg.providerThinkingLevel);
+      }
       messages.push(...output);
     } else if (msg.role === "toolResult") {
       const [callId] = msg.toolCallId.split("|");
@@ -1112,6 +1143,8 @@ function convertResponsesMessages(model, context, allowedToolCallProviders, opti
     if (!isLeadingSystemMessage)
       msgIndex++;
   }
+  if (options?.configurationUpdateEffort !== void 0)
+    pushConfigurationUpdate(options.configurationUpdateEffort);
   return messages;
 }
 function convertResponsesTools(tools, options) {
@@ -1313,6 +1346,7 @@ async function processResponsesStream(openaiStream, output, stream, model, optio
     }
   };
   for await (const event of openaiStream) {
+    await options?.onProviderStreamEvent?.(event, model);
     if (event.type === "response.created") {
       output.responseId = event.response.id;
     } else if (event.type === "response.output_item.added") {
@@ -1429,7 +1463,7 @@ async function processResponsesStream(openaiStream, output, stream, model, optio
         });
         outputSlots.delete(event.output_index);
       } else if (item.type === "function_call" && slot?.type === "toolCall" && slot.block.partialJson !== void 0) {
-        slot.block.arguments = parseStreamingJson(item.arguments || slot.block.partialJson || "{}");
+        Object.assign(slot.block, parseToolCallArguments(item.arguments || slot.block.partialJson));
         if (item.namespace !== void 0)
           slot.block.namespace = item.namespace;
         delete slot.block.partialJson;
@@ -1468,6 +1502,16 @@ async function processResponsesStream(openaiStream, output, stream, model, optio
   }
   if (!sawTerminalResponseEvent) {
     throw new Error("OpenAI Responses stream ended before a terminal response event");
+  }
+  if (output.stopReason === "toolUse") {
+    for (const block of output.content) {
+      if (block.type !== "toolCall")
+        continue;
+      const toolCall = block;
+      if (toolCall.partialJson !== void 0 || toolCall.customInput !== void 0) {
+        throw new Error(`OpenAI Responses stream completed with an unfinished tool call: ${toolCall.name} (${toolCall.id})`);
+      }
+    }
   }
 }
 function mapStopReason(status, incompleteReason) {

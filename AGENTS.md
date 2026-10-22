@@ -35,9 +35,16 @@ Consequences:
    bundle — pi-ai's relative imports AND its runtime dep `partial-json` are
    inlined, so nothing resolves at runtime. The converter consumes plain
    data (no instanceof checks), so running a private copy alongside pi's
-   sandboxed pi-ai is safe. After moving the pi-ai peer range, run
-   `npm run vendor` and commit; `test/vendor-parity.test.ts` fails when the
-   vendored copy drifts from the installed pi-ai.
+   sandboxed pi-ai is safe. **Vendor from the pi-ai that the installed
+   `@earendil-works/pi-coding-agent` depends on (its nested copy), not the
+   root-hoisted pi-ai** — other devDependencies can move the root to a newer
+   version than the one pi actually bundles (this happened with pi-ai 1.3.0
+   nested vs 1.4.0 hoisted). After moving the pi-coding-agent devDependency,
+   run `npm run vendor` and commit; `test/vendor-parity.test.ts` resolves the
+   same nested copy, checks the vendored banner version against it, and
+   fails when conversions drift (fixtures cover cross-model fc_/ctc_ id
+   dropping, whitespace-only/empty tool output, additional_tools, and
+   grammar/strict tool conversion).
 3. `test/import-contract.test.ts` enforces all of this statically (plus the
    host-provided/dependencies rule mirroring pi's resource-loader). It would
    have caught the 0.1.5 regression. Keep it passing; extend SANDBOXED_IDS

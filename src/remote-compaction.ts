@@ -158,21 +158,31 @@ function normalizedBaseUrl(value: string | undefined): string {
 
 /**
  * True for the built-in `openai` provider on the Responses API, ignoring the
- * effective base URL (which may come from provider auth). Honours the
- * per-model opt-out; `isOpenAIServerCompactionModel` adds the base-URL check.
+ * effective base URL (which may come from provider auth).
+ *
+ * Defaults to the probed model family only. Live probe of the first-party
+ * connection (2026-10-23): `context_management` was accepted by
+ * gpt-6-sol/luna/astra and gpt-6.1-sol; every pre-GPT-6 catalog model
+ * (gpt-4.1, o3, o4-mini, gpt-5.x, daybreak, realtime) is rejected by that
+ * connection at the *model* level ("not supported when using Codex with a
+ * ChatGPT account"), so their `context_management` acceptance is UNVERIFIED.
+ * Sending it there would put an unsupported parameter on every request and
+ * silently break auto-compaction. A model outside the probed family opts in
+ * with `compat.supportsServerCompaction: true` (or the top-level flag); any
+ * model opts out with `false`. `isOpenAIServerCompactionModel` adds the
+ * base-URL check.
  */
-export function isServerCompactionCandidate(
-  model: Model<any> | undefined,
-): model is Model<any> {
+const SERVER_COMPACTION_PROBED_MODEL_ID = /^gpt-6(?:[.-]|$)/;
+
+export function isServerCompactionCandidate(model: Model<any> | undefined): boolean {
   if (!model) return false;
+  if (model.provider !== "openai" || model.api !== "openai-responses") return false;
   const declared =
     (model as any).supportsServerCompaction ??
     (model.compat as any)?.supportsServerCompaction;
-  return (
-    declared !== false &&
-    model.provider === "openai" &&
-    model.api === "openai-responses"
-  );
+  if (declared === false) return false;
+  if (declared === true) return true;
+  return SERVER_COMPACTION_PROBED_MODEL_ID.test(model.id);
 }
 
 /**
@@ -180,16 +190,16 @@ export function isServerCompactionCandidate(
  * effective base URL is the first-party api.openai.com endpoint.
  *
  * This identifies the *connection* on which server-side `context_management`
- * compaction was probed; it is not a per-model capability proof. Proxy and
- * auth-overridden base URLs are deliberately excluded, and a model may opt out
- * with `compat.supportsServerCompaction: false`.
+ * compaction was probed; it is not a per-model capability proof (see
+ * `isServerCompactionCandidate`). Proxy and auth-overridden base URLs are
+ * deliberately excluded.
  */
 export function isOpenAIServerCompactionModel(
   model: Model<any> | undefined,
   providerBaseUrl?: string,
-): model is Model<any> {
+): boolean {
   if (!isServerCompactionCandidate(model)) return false;
-  const effective = providerBaseUrl ?? model.baseUrl;
+  const effective = providerBaseUrl ?? model?.baseUrl;
   return normalizedBaseUrl(effective) === OPENAI_RESPONSES_BASE_URL;
 }
 
@@ -327,16 +337,6 @@ export function updateServerCompactionCapture(
       : {}),
     ...(tokenUsage ? { tokenUsage } : {}),
   };
-}
-
-export function serverCompactionTokensBefore(
-  tokenUsage: Record<string, unknown> | undefined,
-): number {
-  if (!tokenUsage) return 0;
-  return (
-    numeric(tokenUsage.input_tokens ?? tokenUsage.inputTokens) ||
-    numeric(tokenUsage.total_tokens ?? tokenUsage.totalTokens)
-  );
 }
 
 /**
