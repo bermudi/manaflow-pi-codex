@@ -3,7 +3,7 @@
 A [pi](https://pi.dev) package maintained by [bermudi](https://github.com/bermudi), forked from [Manaflow](https://github.com/manaflow-ai)
 that gives Codex models OpenAI Codex's native `apply_patch` and web search tools.
 
-When the selected model uses the `openai-codex` provider, its model ID contains `codex`, it is a `deepseek-v4` model (trained on the Codex harness), or it is the built-in `openai` provider on the Responses API with `compat.supportsOpenAIGrammarTools` (gpt-5.x, gpt-6 family), the extension replaces active `edit` and `write` tools with `apply_patch`. Switching to any other model restores the tools it removed. Legacy Responses models without grammar tools (gpt-4o, o1/o3/o4, realtime) keep the native editor: they would receive an unconstrained JSON `patch` string instead of a Lark-grammar tool, which is worse than `edit`.
+When the selected model's protocol carries OpenAI custom/grammar tools (`openai-responses`, `azure-openai-responses`) and its catalog compat sets `supportsOpenAIGrammarTools`, or the model is served by the `openai-codex` provider, has `codex` in its ID, or is a `deepseek-v4` model (trained on the Codex harness), the extension replaces active `edit` and `write` tools with `apply_patch`. Switching to any other model restores the tools it removed. Models whose protocol drops the grammar (legacy Responses entries like gpt-4o, o1/o3/o4, realtime) keep the native editor: they would only get a function tool carrying a JSON `patch` string with an unconstrained patch body, which is worse than `edit`.
 
 ## Install
 
@@ -31,7 +31,7 @@ installing it.
 
 ## Why the Codex dependency?
 
-The model-facing tool does not require a provider workaround. Pi supports OpenAI custom/freeform tools with Lark grammars, and pi's Codex model catalog enables that capability.
+The model-facing tool does not require a provider workaround. Pi supports OpenAI custom/freeform tools with Lark grammars, and the model catalog enables that capability on the Codex models and on the `openai` and `azure` Responses entries.
 
 Applying a patch correctly is separate. This package pins `@openai/codex` and invokes its native binary's internal `apply_patch` entrypoint, so parsing, fuzzy context matching, file moves, errors, and output match the upstream implementation instead of a partial TypeScript rewrite.
 
@@ -74,6 +74,15 @@ The native Codex package is large because it includes the platform binary.
 - Supports add, update, move, and delete hunks.
 - Executes patches sequentially relative to other tool calls.
 - Respects tool selection: if `apply_patch` was excluded initially, `edit` and `write` are not replaced.
+- Gives the patch tool to every Responses-protocol model whose compat advertises
+  grammar tools — the `openai`, `azure`, `github-copilot`, `opencode`, and
+  `cloudflare-ai-gateway` catalog entries — and keeps `edit`/`write` where the
+  grammar would be dropped. On upgrade that silently changes the tool surface
+  for those models: if a resold endpoint advertises the capability but rejects a
+  `type: "custom"` tool, requests there fail; exclude `apply_patch` from the
+  tool list to fall back. `web_search` stays Codex-only: it posts to Codex's own
+  search endpoint with the Codex OAuth token, which an API-key connection cannot
+  satisfy.
 - Falls back to pi's normal `edit` and `write` tools after switching away from a Codex model.
 - Enables Codex's standalone live `web_search` tool for the `openai-codex` provider. Rendering adapts: standalone (or with goodies' clean-tui disabled) it renders like pi's native tool rows with the search output visible; with bermudis-pi-goodies' clean-tui enabled it renders as a clean burst row (same-tool calls share one block; output hidden until the row is expanded).
 - Sends standalone search to the resolved Codex `/alpha/search` endpoint, preserving provider base URL and header overrides.

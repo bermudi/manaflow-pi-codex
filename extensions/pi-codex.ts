@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { StringEnum, type Model } from "@earendil-works/pi-ai";
+import { StringEnum, type Model, type OpenAIResponsesCompat } from "@earendil-works/pi-ai";
 import {
   CompactionSummaryMessageComponent,
   generateDiffString,
@@ -181,6 +181,28 @@ function isOpenAIResponsesModel(model: Model<any> | undefined): boolean {
   return model?.provider === "openai" && model?.api === "openai-responses";
 }
 
+/**
+ * Model compat flags this package reads, typed against pi-ai's own interface so
+ * a renamed property fails tsc instead of silently disabling a capability.
+ */
+function modelCompat(model: Model<any> | undefined): OpenAIResponsesCompat | undefined {
+  return model?.compat as OpenAIResponsesCompat | undefined;
+}
+
+// pi-ai serializes `constrainedSampling` as an OpenAI custom tool with a Lark
+// grammar on these protocols; anywhere else the grammar is dropped silently
+// and the tool degrades to a JSON `patch` string. Which provider serves the
+// endpoint is irrelevant to that contract, so this is deliberately not a
+// provider allowlist.
+const GRAMMAR_TOOL_APIS = new Set(["openai-responses", "azure-openai-responses"]);
+
+function supportsGrammarTools(model: Model<any> | undefined): boolean {
+  return (
+    GRAMMAR_TOOL_APIS.has(model?.api ?? "") &&
+    modelCompat(model)?.supportsOpenAIGrammarTools === true
+  );
+}
+
 function supportsCodexRemoteCompaction(model: Model<any> | undefined): boolean {
   if (!isOpenAICodexModel(model)) return false;
   const declared =
@@ -255,7 +277,9 @@ function installCodexCompactionThreshold() {
       configuredServerCompactionReserveTokens = settings.reserveTokens;
       return { ...settings, reserveTokens: 0 };
     }
-    const settings = original.call(this);
+    // Forward pi's own model argument: dropping it silently discards every
+    // `compaction.modelOverrides` entry for the whole session.
+    const settings = original.call(this, model);
     if (!activeCodexContextWindow) return settings;
     return {
       ...settings,
@@ -352,19 +376,22 @@ type ApplyPatchDetails = {
 
 function isCodexModel(model: Model<any> | undefined): boolean {
   // Tool selection follows the wire protocol first. A subrouter alias may
-  // expose the Codex Responses API without containing "codex" in its name.
-  // The built-in openai provider on the Responses API speaks the same
-  // freeform-tool contract as Codex, so the patch tool belongs there too —
-  // but only for models that advertise grammar-tool support, because
-  // apply_patch is a Lark-grammar tool. Legacy Responses models (gpt-4o,
-  // o1/o3/o4, realtime) would receive an unconstrained JSON `patch` string
-  // instead, which is worse than pi's native edit.
+  // expose the Codex Responses API without containing "codex" in its name,
+  // and the plain `openai`/`azure` Responses connections carry the same
+  // freeform-tool contract as Codex — so the patch tool follows the protocol,
+  // not a provider allowlist. Models whose protocol drops the grammar keep
+  // pi's native edit: they would only get a function tool carrying an
+  // unconstrained JSON `patch` string, which is worse than `edit`. Chat
+  // completions stay out of scope: pi-ai can carry a grammar there, but no
+  // probe has shown a Codex-trained model emitting patches through that JSON
+  // envelope.
   // DeepSeek-v4 models are trained on the Codex harness and emit native
-  // apply_patch output.
+  // apply_patch output. The id matches are grandfathered: Codex-trained models
+  // emit patch text on any protocol, so they keep the tool even where the
+  // grammar cannot be attached (there the patch rides a JSON `patch` field).
   const modelId = model?.id ?? "";
   return isOpenAICodexModel(model) ||
-    (isOpenAIResponsesModel(model) &&
-      (model?.compat as any)?.supportsOpenAIGrammarTools === true) ||
+    supportsGrammarTools(model) ||
     /(?:^|[-_.])codex(?:$|[-_.])/.test(modelId) ||
     /(?:^|[-_./])deepseek-v4(?:-|$)/.test(modelId);
 }
@@ -579,7 +606,7 @@ export default function piCodex(pi: ExtensionAPI) {
   let fastModeEnabled = false;
   let workingStartedAt: number | undefined;
   let workingTimer: ReturnType<typeof setInterval> | undefined;
-  const removedForCodex = new Set<string>();
+  const removedByPatchSwap = new Set<string>();
   const toolContracts = new ToolContractRegistry();
   let activeToolCatalogFingerprint = "";
 
@@ -630,9 +657,9 @@ export default function piCodex(pi: ExtensionAPI) {
         model: model?.id,
         api: model?.api,
         contextWindow: model?.contextWindow,
-        supportsStrictMode: (model?.compat as any)?.supportsStrictMode,
-        supportsOpenAIGrammarTools: (model?.compat as any)?.supportsOpenAIGrammarTools,
-        supportsToolSearch: (model?.compat as any)?.supportsToolSearch,
+        supportsStrictMode: modelCompat(model)?.supportsStrictMode,
+        supportsOpenAIGrammarTools: modelCompat(model)?.supportsOpenAIGrammarTools,
+        supportsToolSearch: modelCompat(model)?.supportsToolSearch,
       },
     ]);
   }
@@ -809,12 +836,12 @@ export default function piCodex(pi: ExtensionAPI) {
     if (isCodexModel(model) && applyPatchSelected) {
       active.add("apply_patch");
       for (const tool of replacedTools) {
-        if (active.delete(tool)) removedForCodex.add(tool);
+        if (active.delete(tool)) removedByPatchSwap.add(tool);
       }
     } else {
       active.delete("apply_patch");
-      for (const tool of removedForCodex) active.add(tool);
-      removedForCodex.clear();
+      for (const tool of removedByPatchSwap) active.add(tool);
+      removedByPatchSwap.clear();
     }
     if (isOpenAICodexModel(model) && webSearchSelected) active.add("web_search");
     else active.delete("web_search");

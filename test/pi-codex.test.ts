@@ -153,9 +153,13 @@ test("recognizes Codex models", () => {
     } as never),
     true,
   );
+  // No `api` on this fixture: an unknown protocol gets no grammar tool. It is
+  // not a statement about gpt-5.4, whose real catalog entry is grammar-capable
+  // and therefore does get apply_patch.
   assert.equal(isCodexModel({ provider: "openai", id: "gpt-5.4" } as never), false);
-  // The built-in openai provider on the Responses API speaks the same freeform
-  // tool contract as Codex, so grammar-capable models get the patch tool.
+  // Tool selection follows the protocol, so the patch tool is not limited to
+  // the first-party provider: any Responses connection that advertises
+  // grammar tools gets it.
   assert.equal(
     isCodexModel({
       provider: "openai",
@@ -167,8 +171,28 @@ test("recognizes Codex models", () => {
   );
   assert.equal(
     isCodexModel({
+      provider: "azure",
+      id: "gpt-5.1",
+      api: "azure-openai-responses",
+      compat: { supportsOpenAIGrammarTools: true },
+    } as never),
+    true,
+  );
+  // The same connection without the grammar is deliberately excluded, so the
+  // flag — not the provider or the id — decides.
+  assert.equal(
+    isCodexModel({
+      provider: "github-copilot",
+      id: "gpt-5.6-luna",
+      api: "openai-responses",
+      compat: { supportsOpenAIGrammarTools: true },
+    } as never),
+    true,
+  );
+  assert.equal(
+    isCodexModel({
       provider: "openai",
-      id: "gpt-5.6-sol",
+      id: "gpt-6-luna-nogrammar",
       api: "openai-responses",
       compat: { supportsOpenAIGrammarTools: false },
     } as never),
@@ -177,7 +201,7 @@ test("recognizes Codex models", () => {
   // Legacy Responses models have no grammar tools: an unconstrained JSON
   // `patch` string is worse than pi's native edit, so they keep edit/write.
   assert.equal(
-    isCodexModel({ provider: "openai", id: "gpt-4.1", api: "openai-responses" } as never),
+    isCodexModel({ provider: "openai", id: "gpt-4o", api: "openai-responses" } as never),
     false,
   );
   // Same model id on a non-Responses api is not the Codex tool surface.
@@ -816,6 +840,14 @@ test("gives grammar-capable OpenAI Responses models the Codex tool surface", asy
 
   await handlers.get("session_start")?.({}, ctxFor(luna));
   assert.deepEqual(active, ["read", "bash", "apply_patch"]);
+  // The Codex 90% compaction boundary must not leak onto this connection: the
+  // catalog window stays authoritative and pi's own reserve applies. The fake
+  // ctx deliberately has no baseUrl/appendCompaction, which keeps server
+  // compaction inactive — its zero reserve would mask this assertion.
+  assert.equal(
+    SettingsManager.inMemory().getCompactionSettings(luna).reserveTokens,
+    16_384,
+  );
 
   // A legacy Responses model cannot carry the Lark grammar, so it keeps the
   // native editor instead of an unconstrained JSON patch string.
@@ -1667,4 +1699,35 @@ test("second standalone call refreshes its own header after completing", async (
     stripVTControlCharacters(firstRefreshed).split("failed diagnostic").length - 1,
     1,
   );
+});
+
+test("forwards pi's model to getCompactionSettings so per-model overrides survive", () => {
+  // Installing this extension patches SettingsManager.getCompactionSettings to
+  // apply the Codex boundary. Forwarding pi's `model` argument is what keeps
+  // `compaction.modelOverrides` entries — every session, every model — alive.
+  const handlers = new Map<string, (...args: any[]) => unknown>();
+  piCodex({
+    registerCommand() {},
+    appendEntry() {},
+    registerTool() {},
+    getActiveTools: () => ["read", "bash", "edit", "write"],
+    setActiveTools() {},
+    on(name: string, handler: (...args: any[]) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI);
+
+  const settings = SettingsManager.inMemory({
+    compaction: {
+      modelOverrides: {
+        "openai/gpt-4o": { reserveTokens: 999, keepRecentTokens: 1234 },
+      },
+    },
+  });
+  const overridden = settings.getCompactionSettings({
+    provider: "openai",
+    id: "gpt-4o",
+  } as never);
+  assert.equal(overridden.keepRecentTokens, 1_234);
+  assert.equal(overridden.reserveTokens, 999);
 });
