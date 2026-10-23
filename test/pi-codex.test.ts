@@ -154,6 +154,37 @@ test("recognizes Codex models", () => {
     true,
   );
   assert.equal(isCodexModel({ provider: "openai", id: "gpt-5.4" } as never), false);
+  // The built-in openai provider on the Responses API speaks the same freeform
+  // tool contract as Codex, so grammar-capable models get the patch tool.
+  assert.equal(
+    isCodexModel({
+      provider: "openai",
+      id: "gpt-6-luna",
+      api: "openai-responses",
+      compat: { supportsOpenAIGrammarTools: true },
+    } as never),
+    true,
+  );
+  assert.equal(
+    isCodexModel({
+      provider: "openai",
+      id: "gpt-5.6-sol",
+      api: "openai-responses",
+      compat: { supportsOpenAIGrammarTools: false },
+    } as never),
+    false,
+  );
+  // Legacy Responses models have no grammar tools: an unconstrained JSON
+  // `patch` string is worse than pi's native edit, so they keep edit/write.
+  assert.equal(
+    isCodexModel({ provider: "openai", id: "gpt-4.1", api: "openai-responses" } as never),
+    false,
+  );
+  // Same model id on a non-Responses api is not the Codex tool surface.
+  assert.equal(
+    isCodexModel({ provider: "openai", id: "gpt-6-luna", api: "openai-decisions" } as never),
+    false,
+  );
   assert.equal(
     isCodexModel({ provider: "openrouter", id: "deepseek/deepseek-v4-flash-free" } as never),
     true,
@@ -746,6 +777,60 @@ test("swaps write tools only while a Codex model is selected", async () => {
   );
   assert.deepEqual(active, ["read", "bash", "edit", "write"]);
   assert.equal(settings.getCompactionSettings().reserveTokens, 16_384);
+});
+
+test("gives grammar-capable OpenAI Responses models the Codex tool surface", async () => {
+  // The built-in openai provider is a first-class Codex-protocol connection:
+  // gpt-6-luna there must get apply_patch, not pi's edit/write. web_search
+  // stays off because it calls Codex's own chatgpt.com endpoint.
+  let active = ["read", "bash", "edit", "write"];
+  const handlers = new Map<string, (...args: any[]) => unknown>();
+  const pi = {
+    registerCommand() {},
+    appendEntry() {},
+    registerTool(definition: any) {
+      active.push(definition.name);
+    },
+    getActiveTools: () => active,
+    setActiveTools(tools: string[]) {
+      active = tools;
+    },
+    on(name: string, handler: (...args: any[]) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI;
+
+  piCodex(pi);
+  const luna = {
+    provider: "openai",
+    id: "gpt-6-luna",
+    api: "openai-responses",
+    contextWindow: 272_000,
+    compat: { supportsOpenAIGrammarTools: true },
+  };
+  const ctxFor = (model: any) => ({
+    model,
+    sessionManager: { getBranch: () => [] },
+    hasUI: false,
+  });
+
+  await handlers.get("session_start")?.({}, ctxFor(luna));
+  assert.deepEqual(active, ["read", "bash", "apply_patch"]);
+
+  // A legacy Responses model cannot carry the Lark grammar, so it keeps the
+  // native editor instead of an unconstrained JSON patch string.
+  const legacy = {
+    provider: "openai",
+    id: "gpt-4.1",
+    api: "openai-responses",
+    contextWindow: 1_047_576,
+  };
+  await handlers.get("model_select")?.({ model: legacy }, ctxFor(legacy));
+  assert.deepEqual(active, ["read", "bash", "edit", "write"]);
+
+  // Switching back re-applies the patch tool.
+  await handlers.get("model_select")?.({ model: luna }, ctxFor(luna));
+  assert.deepEqual(active, ["read", "bash", "apply_patch"]);
 });
 
 test("formats the selection-friendly working ticker", () => {

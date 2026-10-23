@@ -3,7 +3,7 @@
 A [pi](https://pi.dev) package maintained by [bermudi](https://github.com/bermudi), forked from [Manaflow](https://github.com/manaflow-ai)
 that gives Codex models OpenAI Codex's native `apply_patch` and web search tools.
 
-When the selected model uses the `openai-codex` provider, its model ID contains `codex`, or it is a `deepseek-v4` model (trained on the Codex harness), the extension replaces active `edit` and `write` tools with `apply_patch`. Switching to any other model restores the tools it removed.
+When the selected model uses the `openai-codex` provider, its model ID contains `codex`, it is a `deepseek-v4` model (trained on the Codex harness), or it is the built-in `openai` provider on the Responses API with `compat.supportsOpenAIGrammarTools` (gpt-5.x, gpt-6 family), the extension replaces active `edit` and `write` tools with `apply_patch`. Switching to any other model restores the tools it removed. Legacy Responses models without grammar tools (gpt-4o, o1/o3/o4, realtime) keep the native editor: they would receive an unconstrained JSON `patch` string instead of a Lark-grammar tool, which is worse than `edit`.
 
 ## Install
 

@@ -353,10 +353,18 @@ type ApplyPatchDetails = {
 function isCodexModel(model: Model<any> | undefined): boolean {
   // Tool selection follows the wire protocol first. A subrouter alias may
   // expose the Codex Responses API without containing "codex" in its name.
+  // The built-in openai provider on the Responses API speaks the same
+  // freeform-tool contract as Codex, so the patch tool belongs there too —
+  // but only for models that advertise grammar-tool support, because
+  // apply_patch is a Lark-grammar tool. Legacy Responses models (gpt-4o,
+  // o1/o3/o4, realtime) would receive an unconstrained JSON `patch` string
+  // instead, which is worse than pi's native edit.
   // DeepSeek-v4 models are trained on the Codex harness and emit native
   // apply_patch output.
   const modelId = model?.id ?? "";
   return isOpenAICodexModel(model) ||
+    (isOpenAIResponsesModel(model) &&
+      (model?.compat as any)?.supportsOpenAIGrammarTools === true) ||
     /(?:^|[-_.])codex(?:$|[-_.])/.test(modelId) ||
     /(?:^|[-_./])deepseek-v4(?:-|$)/.test(modelId);
 }
