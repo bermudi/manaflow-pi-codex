@@ -1385,10 +1385,16 @@ export default function piCodex(pi: ExtensionAPI) {
     if (isOpenAIResponsesModel(model)) {
       const count = installTopLevelResponsesTools(event.payload, pi.getActiveTools());
       if (count !== undefined && !loggedTopLevelResponsesTools) {
-        process.stderr.write(
-          `[pi-codex] exposing ${count} tools through the OpenAI Responses top-level tools field\n`,
-        );
         loggedTopLevelResponsesTools = true;
+        // Diagnostics must stay silent by default: pi's TUI does not intercept
+        // stdout/stderr, so a write between frames is only erased by the next
+        // repaint — during idle cache-warming requests there is none, and the
+        // line lands visibly in the input area. Opt in with PI_CODEX_DEBUG=1.
+        if (process.env.PI_CODEX_DEBUG === "1") {
+          process.stderr.write(
+            `[pi-codex] exposing ${count} tools through the OpenAI Responses top-level tools field\n`,
+          );
+        }
       }
     }
 
