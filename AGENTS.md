@@ -102,6 +102,23 @@ assistant message already carries it), and do not commit a checkpoint for a
 truncated (`stopReason: "length"`) response before pi's recoverable-length
 recovery runs.
 
+## Tool visibility (Pi 1.4.0)
+
+The recorded `toolsAdded` list proves Pi declared a tool locally, not that the
+serving backend exposed it to the model. A model's "list your tools" answer is
+not a registry query either. Test actual calls. On the plain `openai` Responses
+CLI connection, a live comparison with the same custom SYSTEM.md showed
+`input[].additional_tools` could be accepted without usable tool visibility;
+moving the exact schemas to top-level `tools` restored a native apply_patch call.
+`src/responses-tools.ts` performs that request-boundary compatibility repair.
+Keep Codex's working incremental transport unchanged, preserve wire schemas,
+and filter removed tools rather than reviving historical declarations.
+
+A custom SYSTEM.md also replaces Pi's generated tools/rules sections, so
+`promptGuidelines` may never reach the model. Essential patch-tool guidance
+belongs in its description as well. Do not infer active tools from the static
+inventory in a custom prompt, or rewrite the operator's config as a workaround.
+
 ## Conventions
 
 - Node ≥ 22.19, ESM, TypeScript strict (`npm run check`).

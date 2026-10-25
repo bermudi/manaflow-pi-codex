@@ -81,6 +81,7 @@ import {
   resolveCodexTruncationPolicy,
   truncateCodexOutput,
 } from "../src/output-truncation.ts";
+import { installTopLevelResponsesTools } from "../src/responses-tools.ts";
 
 const grammarPath = fileURLToPath(new URL("../src/apply-patch.lark", import.meta.url));
 const applyPatchGrammar = readFileSync(grammarPath, "utf8");
@@ -609,6 +610,7 @@ export default function piCodex(pi: ExtensionAPI) {
   const removedByPatchSwap = new Set<string>();
   const toolContracts = new ToolContractRegistry();
   let activeToolCatalogFingerprint = "";
+  let loggedTopLevelResponsesTools = false;
 
   // Codex's model_visible_specs() contains direct tools only. Deferred
   // contracts stay registered for Pi's tool-search lifecycle and are included
@@ -1049,7 +1051,7 @@ export default function piCodex(pi: ExtensionAPI) {
     name: "apply_patch",
     label: "Apply Patch",
     description:
-      "Use OpenAI Codex's apply_patch format to add, update, move, or delete files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+      "Use OpenAI Codex's apply_patch format to add, update, move, or delete files. Call this tool directly for manual file edits; it is not a shell command. Do not edit files through bash. This is a FREEFORM tool, so do not wrap the patch in JSON.",
     promptSnippet: "Apply an OpenAI Codex patch to add, update, move, or delete files",
     promptGuidelines: [
       "Use apply_patch for manual file edits; send a complete `*** Begin Patch` through `*** End Patch` patch.",
@@ -1377,6 +1379,19 @@ export default function piCodex(pi: ExtensionAPI) {
     const model = ctx.model;
     if (!model) return;
 
+    // The plain OpenAI connection can silently ignore input.additional_tools.
+    // Do this before every early return (including compaction opt-outs/proxies).
+    // Codex's transport does expose incremental declarations and stays intact.
+    if (isOpenAIResponsesModel(model)) {
+      const count = installTopLevelResponsesTools(event.payload, pi.getActiveTools());
+      if (count !== undefined && !loggedTopLevelResponsesTools) {
+        process.stderr.write(
+          `[pi-codex] exposing ${count} tools through the OpenAI Responses top-level tools field\n`,
+        );
+        loggedTopLevelResponsesTools = true;
+      }
+    }
+
     // Repair a persisted server checkpoint before anything capability-gated
     // or awaited. The persisted marker is a placeholder, not a summary: a
     // request that keeps it loses the entire pre-checkpoint conversation.
@@ -1619,6 +1634,7 @@ export default function piCodex(pi: ExtensionAPI) {
     stopWorkingTicker(ctx);
   });
   pi.on("session_start", async (_event, ctx) => {
+    loggedTopLevelResponsesTools = false;
     retryTurnState = undefined;
     turnState = undefined;
     clearServerCompactionState();

@@ -31,7 +31,7 @@ installing it.
 
 ## Why the Codex dependency?
 
-The model-facing tool does not require a provider workaround. Pi supports OpenAI custom/freeform tools with Lark grammars, and the model catalog enables that capability on the Codex models and on the `openai` and `azure` Responses entries.
+Pi supports OpenAI custom/freeform tools with Lark grammars, and the model catalog enables that capability on the Codex models and on the `openai` and `azure` Responses entries.
 
 Applying a patch correctly is separate. This package pins `@openai/codex` and invokes its native binary's internal `apply_patch` entrypoint, so parsing, fuzzy context matching, file moves, errors, and output match the upstream implementation instead of a partial TypeScript rewrite.
 
@@ -67,6 +67,16 @@ The native Codex package is large because it includes the platform binary.
 ## Behavior
 
 - Uses the upstream freeform patch format and Lark grammar.
+- On the plain `openai` Responses connection, sends tool declarations through
+  the top-level `tools` field rather than `input[].additional_tools`. A live
+  Pi 1.4.0 CLI comparison showed the latter could be accepted without the model
+  acknowledging the tools; moving the same schemas to the top level restored
+  tool visibility and a successful native patch call, without changing
+  `SYSTEM.md`. All declared tools are moved, not just `apply_patch`; grammar
+  schemas and prepared descriptions are preserved, inactive tools are omitted,
+  and later definitions replace earlier ones. This trades incremental tool
+  declaration caching for reliable visibility. Codex's incremental transport is
+  unchanged.
 - Keeps each registered tool's TypeBox schema, exposure, execution mode,
   capabilities, and output budget in one Codex tool contract. Remote
   compaction sends the same direct model-visible schema projection as the
