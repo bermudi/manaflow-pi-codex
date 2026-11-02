@@ -139,6 +139,14 @@ export interface ServerCompactionCapture {
    * capture without an id must never be attributed to the foreground turn.
    */
   responseId?: string;
+  /**
+   * Response that opened this in-flight slot (`response.created`). Output
+   * events carry no response id, and a cache-warming replay can open its own
+   * stream while the foreground one is still running; the slot then belongs
+   * to the most recently created stream, and a completion for any other
+   * response must not inherit its item or boundary.
+   */
+  createdResponseId?: string;
   item?: ResponseItem;
   tokenUsage?: Record<string, unknown>;
   /**
@@ -357,8 +365,13 @@ export function updateServerCompactionCapture(
   if (event.type === "response.created") {
     // A stream starts fresh. Completed captures are retained by the caller's
     // per-response map; anything still in this slot belongs to the stream that
-    // just ended and must not absorb output items from the new one.
-    return undefined;
+    // just ended and must not absorb output items from the new one. Remember
+    // which response opened the slot so an overlapping stream's completion
+    // cannot claim it.
+    const createdId = objectValue(event.response)?.id;
+    return typeof createdId === "string" && createdId.length > 0
+      ? { createdResponseId: createdId }
+      : undefined;
   }
 
   if (event.type === "response.output_item.added") {
@@ -395,8 +408,17 @@ export function updateServerCompactionCapture(
   // stream's item or boundary. Cache warming replays the same callbacks while
   // the foreground response is still streaming, so its terminal event can
   // otherwise overwrite the foreground capture wholesale.
+  //
+  // The same holds for a slot opened by another stream's response.created:
+  // when a warming replay starts mid-foreground, the slot belongs to the
+  // warming stream, and a foreground completion without an authoritative
+  // output list would otherwise commit the warming response's item.
   const sameResponse =
-    capture?.responseId === undefined || capture.responseId === responseId;
+    (capture?.responseId === undefined || capture.responseId === responseId) &&
+    // A completion without an id cannot be compared; keep the legacy fold.
+    (capture?.createdResponseId === undefined ||
+      responseId === undefined ||
+      capture.createdResponseId === responseId);
   const previous = sameResponse ? capture : undefined;
   const completedIndex = output ? lastCompactionIndex(output) : -1;
   const completedContentCount =

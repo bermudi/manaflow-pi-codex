@@ -2235,3 +2235,112 @@ test("manual server fold records the fold request's cost on the compaction entry
     restore();
   }
 });
+
+// ── Overlapping streams: a warming replay opened mid-foreground ──
+//
+// pi's CacheWarmer.refresh replays the request with the original
+// onPayload/onProviderStreamEvent callbacks during the streaming phase, so a
+// warming stream can open while the foreground one is still running. Output
+// events carry no response id, and response.completed may arrive with an
+// empty output array on this connection (2026-10-29 probe), so the slot's
+// item is the only evidence — and after the warming response.created it
+// belongs to the warming stream.
+
+test("a completion cannot claim a slot opened by another response", () => {
+  const warming = { type: "compaction", id: "cmp_warm", encrypted_content: "warm" };
+  let capture = updateServerCompactionCapture(undefined, {
+    type: "response.created",
+    response: { id: "resp_fg" },
+  });
+  assert.equal(capture?.createdResponseId, "resp_fg");
+  capture = updateServerCompactionCapture(capture, {
+    type: "response.created",
+    response: { id: "resp_warm" },
+  });
+  capture = updateServerCompactionCapture(capture, {
+    type: "response.output_item.done",
+    output_index: 0,
+    item: warming,
+  });
+  const foreground = updateServerCompactionCapture(capture, {
+    type: "response.completed",
+    response: { id: "resp_fg", output: [], usage: { input_tokens: 10 } },
+  });
+  assert.equal(foreground?.responseId, "resp_fg");
+  assert.equal(foreground?.item, undefined, "the warming item must not become resp_fg's");
+  assert.equal(foreground?.contentCountBefore, undefined);
+
+  // The owning stream still folds its own slot item.
+  const own = updateServerCompactionCapture(capture, {
+    type: "response.completed",
+    response: { id: "resp_warm", output: [] },
+  });
+  assert.equal(own?.item?.id, "cmp_warm");
+
+  // A completion without an id cannot be compared and keeps the legacy fold.
+  const legacy = updateServerCompactionCapture(capture, {
+    type: "response.completed",
+    response: { output: [], usage: { input_tokens: 10 } },
+  });
+  assert.equal(legacy?.item?.id, "cmp_warm");
+});
+
+test("turn_end never commits a warming response's checkpoint for the foreground", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel());
+  await handlers.get("session_start")?.({}, ctx);
+  const request = handlers.get("before_provider_request")!;
+  const stream = (data: any) =>
+    handlers.get("provider_stream_event")?.({
+      provider: "openai",
+      api: "openai-responses",
+      model: "gpt-6-sol",
+      data,
+    });
+  const foreground = { type: "compaction", id: "cmp_fg", encrypted_content: "fg" };
+  const warming = { type: "compaction", id: "cmp_warm", encrypted_content: "warm" };
+  const usage = { input_tokens: 250_000, output_tokens: 10 };
+
+  handlers.get("turn_start")?.({ turnIndex: 0, timestamp: 1 });
+  await request({ payload: { input: [] } }, ctx);
+  stream({ type: "response.created", response: { id: "resp_fg" } });
+  stream({ type: "response.output_item.added", output_index: 0, item: { type: "reasoning" } });
+  stream({ type: "response.output_item.done", output_index: 1, item: foreground });
+  // The warmer's timer fires while the foreground is still generating.
+  await request({ payload: { input: [] } }, ctx);
+  stream({ type: "response.created", response: { id: "resp_warm" } });
+  stream({ type: "response.output_item.added", output_index: 2, item: { type: "message" } });
+  stream({ type: "response.output_item.done", output_index: 0, item: warming });
+  stream({ type: "response.completed", response: { id: "resp_fg", output: [], usage } });
+  stream({ type: "response.completed", response: { id: "resp_warm", output: [], usage } });
+
+  const result = handlers.get("turn_end")?.(
+    {
+      entries: [],
+      messageEntryId: "assistant-fg",
+      message: {
+        role: "assistant",
+        responseId: "resp_fg",
+        stopReason: "stop",
+        content: [
+          { type: "thinking", thinking: "t" },
+          { type: "text", text: "after the checkpoint" },
+        ],
+      },
+      toolResults: [],
+    },
+    ctx,
+  );
+  const entries = result?.entries ?? [];
+  const compaction = entries.find((entry: any) => entry.type === "compaction");
+  assert.notEqual(
+    compaction?.details.item.id,
+    "cmp_warm",
+    "the warming response's item was committed as the foreground checkpoint",
+  );
+  // The foreground item is unattributable once the streams overlap and the
+  // completion carries no output list: leave it uncommitted rather than
+  // guessing, and leave the assistant message untouched.
+  assert.equal(compaction, undefined);
+  assert.equal(entries.some((entry: any) => entry.type === "context_edit"), false);
+});
