@@ -95,7 +95,10 @@ function collectSourceFiles(dir: string, acc: string[] = []): string[] {
     const full = join(dir, entry);
     if (statSync(full).isDirectory()) {
       collectSourceFiles(full, acc);
-    } else if (/\.(ts|js)$/.test(entry)) {
+    } else if (/\.(?:[cm]?ts|[cm]?js)$/.test(entry) && !/\.d\.[cm]?ts$/.test(entry)) {
+      // Include .mjs/.cjs: the vendored converter is an .mjs module whose
+      // self-containment (nothing resolved at runtime) is the whole point of
+      // vendoring. Declaration files are never executed.
       acc.push(full);
     }
   }
