@@ -33,6 +33,11 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
 }
 
 child.on("exit", (code, signal) => {
-  if (signal) process.kill(process.pid, signal);
-  else process.exit(code ?? 1);
+  if (signal) {
+    // Re-raise so callers see the same termination as pi itself. Our own
+    // forwarding listener would otherwise swallow the re-raise (Node runs the
+    // listener instead of the default action) and the wrapper would exit 0.
+    process.removeAllListeners(signal);
+    process.kill(process.pid, signal);
+  } else process.exit(code ?? 1);
 });
