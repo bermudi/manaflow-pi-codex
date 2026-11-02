@@ -1741,3 +1741,64 @@ test("forwards pi's model to getCompactionSettings so per-model overrides surviv
   assert.equal(overridden.keepRecentTokens, 1_234);
   assert.equal(overridden.reserveTokens, 999);
 });
+
+// ── Codex compaction stream terminals follow pi-ai's Codex transport ──
+//
+// pi-ai's mapCodexEvents (1.3.0 and 1.4.0) treats `response.done` as the
+// Codex backend's alias for `response.completed`, and turns `error` /
+// `response.failed` into errors carrying the server's message.
+
+function codexSse(events: unknown[]): string {
+  return [...events.map((event) => `data: ${JSON.stringify(event)}`), ""].join("\n");
+}
+
+test("Codex compaction accepts the backend's response.done terminal", () => {
+  const compacted = { type: "compaction", encrypted_content: "opaque" };
+  const usage = { input_tokens: 10, output_tokens: 2 };
+  const parsed = parseRemoteCompactionSse(codexSse([
+    { type: "response.output_item.done", item: compacted },
+    { type: "response.done", response: { id: "response-done", usage } },
+  ]));
+  assert.deepEqual(parsed, {
+    compaction: compacted,
+    responseId: "response-done",
+    tokenUsage: usage,
+  });
+});
+
+test("Codex compaction surfaces the server's failure instead of a truncation", () => {
+  assert.throws(
+    () => parseRemoteCompactionSse(codexSse([
+      { type: "response.created", response: { id: "r" } },
+      {
+        type: "response.failed",
+        response: { id: "r", error: { code: "context_length_exceeded", message: "Your input exceeds the context window" } },
+      },
+    ])),
+    /Codex remote compaction failed: Your input exceeds the context window/,
+  );
+  assert.throws(
+    () => parseRemoteCompactionSse(codexSse([
+      { type: "error", code: "rate_limit_exceeded", message: "Rate limit reached" },
+    ])),
+    /Codex remote compaction failed: Rate limit reached/,
+  );
+  assert.throws(
+    () => parseRemoteCompactionSse(codexSse([
+      { type: "error", error: { code: "server_error" } },
+    ])),
+    /Codex remote compaction failed: server_error/,
+  );
+  assert.throws(
+    () => parseRemoteCompactionSse(codexSse([
+      { type: "response.incomplete", response: { id: "r", incomplete_details: { reason: "max_output_tokens" } } },
+    ])),
+    /Codex remote compaction stream ended incomplete/,
+  );
+  assert.throws(
+    () => parseRemoteCompactionSse(codexSse([
+      { type: "response.output_item.done", item: { type: "compaction" } },
+    ])),
+    /ended before response.completed/,
+  );
+});

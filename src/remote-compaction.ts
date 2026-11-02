@@ -1022,6 +1022,26 @@ function parseSseData(text: string): any[] {
   return events;
 }
 
+/**
+ * Server diagnosis carried by a Codex `error` or `response.failed` event,
+ * read the way pi-ai's Codex transport reads it (top-level code/message,
+ * then a nested `error` object, then `response.error`).
+ */
+function codexEventFailureMessage(event: Record<string, any>): string {
+  const candidates = [event, objectValue(event.error), objectValue(objectValue(event.response)?.error)];
+  for (const candidate of candidates) {
+    if (typeof candidate?.message === "string" && candidate.message.length > 0) {
+      return candidate.message;
+    }
+  }
+  for (const candidate of candidates) {
+    if (typeof candidate?.code === "string" && candidate.code.length > 0) {
+      return candidate.code;
+    }
+  }
+  return JSON.stringify(event);
+}
+
 export function parseRemoteCompactionSse(text: string): {
   compaction: ResponseItem;
   responseId?: string;
@@ -1030,6 +1050,8 @@ export function parseRemoteCompactionSse(text: string): {
 } {
   const compactions: ResponseItem[] = [];
   let completed = false;
+  let incomplete = false;
+  let failureMessage: string | undefined;
   let responseId: string | undefined;
   let tokenUsage: Record<string, unknown> | undefined;
   let turnState: string | undefined;
@@ -1037,7 +1059,14 @@ export function parseRemoteCompactionSse(text: string): {
     if (event.type === "response.output_item.done" && event.item?.type === "compaction") {
       compactions.push(event.item);
     }
-    if (event.type === "response.completed") {
+    // Same terminal/error contract as pi-ai's Codex transport (mapCodexEvents):
+    // `error` and `response.failed` carry the server's diagnosis, and
+    // `response.done` is the Codex backend's alias for `response.completed`.
+    if (event.type === "error" || event.type === "response.failed") {
+      failureMessage = codexEventFailureMessage(event);
+    }
+    if (event.type === "response.incomplete") incomplete = true;
+    if (event.type === "response.completed" || event.type === "response.done") {
       completed = true;
       responseId = event.response?.id ?? event.response_id;
       if (event.response?.usage && typeof event.response.usage === "object") {
@@ -1054,7 +1083,15 @@ export function parseRemoteCompactionSse(text: string): {
       }
     }
   }
-  if (!completed) throw new Error("Codex remote compaction stream ended before response.completed");
+  if (!completed) {
+    // Name the actual terminal state instead of reporting every failure as a
+    // truncated stream: the server's message is the only diagnostic.
+    if (failureMessage !== undefined) {
+      throw new Error(`Codex remote compaction failed: ${failureMessage}`);
+    }
+    if (incomplete) throw new Error("Codex remote compaction stream ended incomplete");
+    throw new Error("Codex remote compaction stream ended before response.completed");
+  }
   if (!responseId) {
     throw new Error("Codex remote compaction response.completed did not include a response id");
   }
