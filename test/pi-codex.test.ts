@@ -1988,3 +1988,48 @@ test("a resumed Codex loadout regains edit/write when the model is not Codex", a
   await excluded.handlers.get("session_start")?.({ reason: "resume" }, ctx(claude));
   assert.deepEqual(excluded.active(), ["bash", "read", "write"]);
 });
+
+test("/tree navigation re-applies the patch swap for the selected model", async () => {
+  // navigateTree restores the target branch's loadout, then emits
+  // session_tree; the model is unchanged and no model_select follows.
+  let active = ["read", "bash", "edit", "write"];
+  const handlers = new Map<string, (...args: any[]) => any>();
+  piCodex({
+    registerCommand() {},
+    registerTool() {},
+    appendEntry() {},
+    getAllTools: () => ["read", "bash", "edit", "write", "apply_patch"].map((name) => ({ name })),
+    getActiveTools: () => [...active],
+    setActiveTools(names: string[]) {
+      active = [...names];
+    },
+    on(name: string, handler: (...args: any[]) => any) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI);
+  const codex = { id: "gpt-5.6-sol", provider: "openai-codex", api: "openai-codex-responses", contextWindow: 272_000 } as any;
+  const claude = { id: "claude-sonnet-4-6", provider: "anthropic", api: "anthropic-messages", contextWindow: 200_000 } as any;
+  const ctx = (model: any) => ({
+    model,
+    hasUI: false,
+    modelRegistry: { getProviderAuth: async () => undefined },
+    sessionManager: { getBranch: () => [], getSessionId: () => "s" },
+  });
+  const sorted = () => [...active].sort();
+  // Pi registers extension tools active; a Codex session swaps them in.
+  active = ["read", "bash", "edit", "write", "apply_patch"];
+  await handlers.get("session_start")?.({}, ctx(codex));
+  await handlers.get("model_select")?.({ model: claude }, ctx(claude));
+  assert.deepEqual(sorted(), ["bash", "edit", "read", "write"]);
+
+  // Navigate back to a point recorded on Codex while Claude stays selected.
+  active = ["read", "bash", "apply_patch"];
+  handlers.get("session_tree")?.({ type: "session_tree", newLeafId: "a", oldLeafId: "b" }, ctx(claude));
+  assert.deepEqual(sorted(), ["bash", "edit", "read", "write"]);
+
+  // And the reverse: a Claude-era branch while Codex is selected.
+  await handlers.get("model_select")?.({ model: codex }, ctx(codex));
+  active = ["read", "bash", "edit", "write"];
+  handlers.get("session_tree")?.({ type: "session_tree", newLeafId: "c", oldLeafId: "a" }, ctx(codex));
+  assert.deepEqual(sorted(), ["apply_patch", "bash", "read"]);
+});

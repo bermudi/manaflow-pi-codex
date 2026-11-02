@@ -1918,6 +1918,13 @@ export default function piCodex(pi: ExtensionAPI) {
     await refreshServerCompactionState(ctx, ctx.model);
     updateFastModeStatus(ctx);
   });
+  pi.on("session_tree", (_event, ctx) => {
+    // /tree navigation restores the target branch's declared loadout from its
+    // transcript (navigateTree → _restoreToolsFromTranscript) without changing
+    // the model or emitting model_select. Re-apply the swap for the model
+    // that is actually selected.
+    syncTools(ctx.model);
+  });
   pi.on("model_select", async (event, ctx) => {
     syncTools(event.model);
     await refreshServerCompactionState(ctx, event.model);
