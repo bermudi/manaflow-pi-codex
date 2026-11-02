@@ -121,6 +121,10 @@ const CODEX_FAST_MODE_STATUS = "pi-codex-fast-mode";
 const compactionPatchMarker: unique symbol = Symbol.for(
   "pi-codex.provider-compaction-threshold.v1",
 ) as any;
+// The live module's threshold adjustment, rebound on every module evaluation.
+const compactionThresholdHook: unique symbol = Symbol.for(
+  "pi-codex.provider-compaction-threshold-hook.v1",
+) as any;
 const DEFAULT_LOCAL_COMPACTION_RESERVE_TOKENS = 16_384;
 let activeCodexContextWindow: number | undefined;
 // Server-side compaction supplies its own checkpoint, so Pi's local threshold
@@ -134,8 +138,15 @@ let configuredServerCompactionReserveTokens = DEFAULT_LOCAL_COMPACTION_RESERVE_T
 let serverCompactionAppendWarningEmitted = false;
 let serverWebSearchConnectionWarningEmitted = false;
 
+type CompactionModel = Parameters<SettingsManager["getCompactionSettings"]>[0];
+type CompactionSettings = ReturnType<SettingsManager["getCompactionSettings"]>;
+
 type PatchedSettingsPrototype = SettingsManager & {
   [compactionPatchMarker]?: true;
+  [compactionThresholdHook]?: (
+    settings: CompactionSettings,
+    model: CompactionModel,
+  ) => CompactionSettings;
 };
 
 type PatchableCompactionComponent = {
@@ -308,28 +319,47 @@ function isActiveServerCompactionModel(
   return `${model.provider}/${model.id}` === activeServerCompactionKey;
 }
 
+function adjustCompactionSettings(
+  settings: CompactionSettings,
+  model: CompactionModel,
+): CompactionSettings {
+  if (isActiveServerCompactionModel(model)) {
+    // Pi checks `contextTokens > window - reserve` before dispatching. A zero
+    // reserve makes the server's 90% threshold win the crossing request; the
+    // only local trigger left is a genuine overflow, which is the backstop.
+    configuredServerCompactionReserveTokens = settings.reserveTokens;
+    return { ...settings, reserveTokens: 0 };
+  }
+  if (!activeCodexContextWindow) return settings;
+  return {
+    ...settings,
+    reserveTokens: codexCompactionReserve(activeCodexContextWindow),
+  };
+}
+
 function installCodexCompactionThreshold() {
   const prototype = SettingsManager.prototype as PatchedSettingsPrototype;
+  // pi's /reload (ResourceLoader.reload → clearExtensionCache) re-evaluates
+  // this module with fresh state (jiti moduleCache: false), but the host
+  // SettingsManager prototype — and the patch the first evaluation installed —
+  // survive. Rebind the adjustment on every evaluation so the patch consults
+  // the live module's state, not the first evaluation's frozen closure.
+  Object.defineProperty(prototype, compactionThresholdHook, {
+    value: adjustCompactionSettings,
+    configurable: true,
+    writable: true,
+  });
   if (prototype[compactionPatchMarker]) return;
 
   const original = SettingsManager.prototype.getCompactionSettings;
   SettingsManager.prototype.getCompactionSettings = function (model) {
-    if (isActiveServerCompactionModel(model)) {
-      const settings = original.call(this, model);
-      // Pi checks `contextTokens > window - reserve` before dispatching. A zero
-      // reserve makes the server's 90% threshold win the crossing request; the
-      // only local trigger left is a genuine overflow, which is the backstop.
-      configuredServerCompactionReserveTokens = settings.reserveTokens;
-      return { ...settings, reserveTokens: 0 };
-    }
     // Forward pi's own model argument: dropping it silently discards every
     // `compaction.modelOverrides` entry for the whole session.
     const settings = original.call(this, model);
-    if (!activeCodexContextWindow) return settings;
-    return {
-      ...settings,
-      reserveTokens: codexCompactionReserve(activeCodexContextWindow),
-    };
+    const adjust = (SettingsManager.prototype as PatchedSettingsPrototype)[
+      compactionThresholdHook
+    ];
+    return adjust ? adjust(settings, model) : settings;
   };
   Object.defineProperty(prototype, compactionPatchMarker, { value: true });
 }

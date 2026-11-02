@@ -2344,3 +2344,86 @@ test("turn_end never commits a warming response's checkpoint for the foreground"
   assert.equal(compaction, undefined);
   assert.equal(entries.some((entry: any) => entry.type === "context_edit"), false);
 });
+
+// ── /reload: a re-evaluated module owns the compaction threshold patch ──
+//
+// pi's /reload runs ResourceLoader.reload → clearExtensionCache, and the next
+// load re-evaluates the extension (jiti moduleCache: false) with fresh module
+// state. The host SettingsManager prototype — and the getCompactionSettings
+// patch the first evaluation installed — survive the reload, so the patch
+// must consult the live module's state, not the first evaluation's closure.
+
+async function reloadedHarness(generation: number) {
+  const url = new URL("../extensions/pi-codex.ts", import.meta.url);
+  url.search = `?reload=${generation}`;
+  const reloaded = (await import(url.href)).default as typeof piCodex;
+  const handlers = new Map<string, Handler>();
+  reloaded({
+    registerCommand() {},
+    registerTool() {},
+    appendEntry() {},
+    getActiveTools: () => [] as string[],
+    getAllTools: () => [],
+    setActiveTools() {},
+    getSettings: () => ({ compaction: { enabled: true } }),
+    on(name: string, handler: Handler) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI);
+  return handlers;
+}
+
+test("after /reload the threshold patch follows the reloaded module's state", async () => {
+  const settings = SettingsManager.inMemory({ compaction: { reserveTokens: 8_192 } });
+  const server = serverModel();
+  const codex = {
+    id: "gpt-5.6-sol",
+    provider: "openai-codex",
+    api: "openai-codex-responses",
+    baseUrl: "https://chatgpt.com/backend-api",
+    contextWindow: 272_000,
+  } as any;
+  const claude = {
+    id: "claude-sonnet-4-6",
+    provider: "anthropic",
+    api: "anthropic-messages",
+    baseUrl: "https://api.anthropic.com",
+    contextWindow: 200_000,
+  } as any;
+  try {
+    // Reload while server compaction is active; afterwards the same model is
+    // proxied, so the reloaded module turns the server path off. The local
+    // threshold must come back instead of staying suppressed at reserve 0.
+    const first = createHarness();
+    await first.handlers.get("session_start")?.({}, createContext(server).ctx);
+    assert.equal(settings.getCompactionSettings(server).reserveTokens, 0);
+
+    const afterReload = await reloadedHarness(1);
+    const proxied = createContext(server, { providerBaseUrl: "https://proxy.example/v1" }).ctx;
+    await afterReload.get("session_start")?.({}, proxied);
+    const payload: any = { input: [] };
+    await afterReload.get("before_provider_request")?.({ payload }, proxied);
+    assert.equal(Object.hasOwn(payload, "context_management"), false);
+    assert.equal(
+      settings.getCompactionSettings(server).reserveTokens,
+      8_192,
+      "a stale server-compaction state kept pi's local threshold suppressed",
+    );
+
+    // Reload while on Codex, then switch to a non-Codex model.
+    const again = createHarness();
+    await again.handlers.get("session_start")?.({}, createContext(codex).ctx);
+    assert.equal(settings.getCompactionSettings(codex).reserveTokens, CODEX_SOL_RESERVE_TOKENS);
+    const secondReload = await reloadedHarness(2);
+    await secondReload.get("session_start")?.({}, createContext(codex).ctx);
+    await secondReload.get("model_select")?.({ model: claude }, createContext(claude).ctx);
+    assert.equal(
+      settings.getCompactionSettings(claude).reserveTokens,
+      8_192,
+      "a stale Codex context window kept overriding another model's reserve",
+    );
+  } finally {
+    // Rebind the statically imported module for any later test in this file.
+    createHarness();
+  }
+});
