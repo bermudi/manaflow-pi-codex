@@ -922,8 +922,24 @@ export default function piCodex(pi: ExtensionAPI) {
         if (active.delete(tool)) removedByPatchSwap.add(tool);
       }
     } else {
-      active.delete("apply_patch");
+      const removedApplyPatch = active.delete("apply_patch");
       for (const tool of removedByPatchSwap) active.add(tool);
+      // A resumed session restores its last declared loadout from the
+      // transcript (pi's AgentSession constructor runs
+      // _restoreToolsFromTranscript): for a Codex-era session that is
+      // apply_patch with edit/write already swapped out, while this instance
+      // has no record of the swap. Dropping apply_patch then would leave no
+      // file-editing tool at all; bring back the registered tools it replaced.
+      if (
+        removedApplyPatch &&
+        removedByPatchSwap.size === 0 &&
+        !replacedTools.some((tool) => active.has(tool))
+      ) {
+        const registered = new Set(pi.getAllTools().map((tool) => tool.name));
+        for (const tool of replacedTools) {
+          if (registered.has(tool)) active.add(tool);
+        }
+      }
       removedByPatchSwap.clear();
     }
     if (isOpenAICodexModel(model) && webSearchSelected) active.add("web_search");

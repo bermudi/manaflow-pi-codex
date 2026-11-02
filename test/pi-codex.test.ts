@@ -1913,3 +1913,78 @@ test("an interrupted apply_patch is an error, not a successful edit", async () =
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+// ── Resumed Codex sessions keep a file-editing tool off Codex ──
+//
+// pi's AgentSession constructor restores the last declared loadout from the
+// transcript (_restoreToolsFromTranscript → getCurrentTools folds every
+// toolsRemoved/toolsAdded delta). A session recorded on Codex therefore
+// resumes with apply_patch active and edit/write already swapped out, while
+// the new extension instance has no in-memory record of that swap.
+
+function toolSession(initial: string[], registered = ["read", "bash", "edit", "write", "apply_patch", "web_search"]) {
+  let active = [...initial];
+  const handlers = new Map<string, (...args: any[]) => any>();
+  piCodex({
+    registerCommand() {},
+    registerTool() {},
+    appendEntry() {},
+    getAllTools: () => registered.map((name) => ({ name })),
+    getActiveTools: () => [...active],
+    setActiveTools(names: string[]) {
+      active = [...names];
+    },
+    on(name: string, handler: (...args: any[]) => any) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI);
+  return { handlers, active: () => [...active].sort() };
+}
+
+test("a resumed Codex loadout regains edit/write when the model is not Codex", async () => {
+  const codex = {
+    id: "gpt-5.6-sol",
+    provider: "openai-codex",
+    api: "openai-codex-responses",
+    contextWindow: 272_000,
+  } as any;
+  const claude = {
+    id: "claude-sonnet-4-6",
+    provider: "anthropic",
+    api: "anthropic-messages",
+    contextWindow: 200_000,
+  } as any;
+  const ctx = (model: any) => ({
+    model,
+    hasUI: false,
+    modelRegistry: { getProviderAuth: async () => undefined },
+    sessionManager: { getBranch: () => [], getSessionId: () => "s" },
+  });
+
+  // Resumed on Codex, then switched away.
+  const resumed = toolSession(["read", "bash", "apply_patch"]);
+  await resumed.handlers.get("session_start")?.({ reason: "resume" }, ctx(codex));
+  assert.deepEqual(resumed.active(), ["apply_patch", "bash", "read"]);
+  await resumed.handlers.get("model_select")?.({ model: claude }, ctx(claude));
+  assert.deepEqual(resumed.active(), ["bash", "edit", "read", "write"]);
+
+  // Resumed directly on a non-Codex model.
+  const resumedOff = toolSession(["read", "bash", "apply_patch"]);
+  await resumedOff.handlers.get("session_start")?.({ reason: "resume" }, ctx(claude));
+  assert.deepEqual(resumedOff.active(), ["bash", "edit", "read", "write"]);
+
+  // A deliberate partial loadout keeps its choice: write stays, edit is not forced back.
+  const partial = toolSession(["read", "bash", "write", "apply_patch"]);
+  await partial.handlers.get("session_start")?.({ reason: "resume" }, ctx(claude));
+  assert.deepEqual(partial.active(), ["bash", "read", "write"]);
+
+  // A loadout without apply_patch (e.g. read-only) is never given edit tools.
+  const readOnly = toolSession(["read", "bash"]);
+  await readOnly.handlers.get("session_start")?.({ reason: "resume" }, ctx(claude));
+  assert.deepEqual(readOnly.active(), ["bash", "read"]);
+
+  // Only registered tools are restored (e.g. --exclude-tools edit).
+  const excluded = toolSession(["read", "bash", "apply_patch"], ["read", "bash", "write", "apply_patch"]);
+  await excluded.handlers.get("session_start")?.({ reason: "resume" }, ctx(claude));
+  assert.deepEqual(excluded.active(), ["bash", "read", "write"]);
+});
