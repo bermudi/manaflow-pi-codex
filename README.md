@@ -1,7 +1,8 @@
 # pi-codex
 
 A [pi](https://pi.dev) package maintained by [bermudi](https://github.com/bermudi), forked from [Manaflow](https://github.com/manaflow-ai)
-that gives Codex models OpenAI Codex's native `apply_patch` and web search tools.
+that provides Codex's native `apply_patch` and standalone search tools, plus
+OpenAI-hosted web search for the first-party Responses API.
 
 When the selected model's protocol carries OpenAI custom/grammar tools (`openai-responses`, `azure-openai-responses`) and its catalog compat sets `supportsOpenAIGrammarTools`, or the model is served by the `openai-codex` provider, has `codex` in its ID, or is a `deepseek-v4` model (trained on the Codex harness), the extension replaces active `edit` and `write` tools with `apply_patch`. Switching to any other model restores the tools it removed. Models whose protocol drops the grammar (legacy Responses entries like gpt-4o, o1/o3/o4, realtime) keep the native editor: they would only get a function tool carrying a JSON `patch` string with an unconstrained patch body, which is worse than `edit`.
 
@@ -90,12 +91,22 @@ The native Codex package is large because it includes the platform binary.
   grammar would be dropped. On upgrade that silently changes the tool surface
   for those models: if a resold endpoint advertises the capability but rejects a
   `type: "custom"` tool, requests there fail; exclude `apply_patch` from the
-  tool list to fall back. `web_search` stays Codex-only: it posts to Codex's own
-  search endpoint with the Codex OAuth token, which an API-key connection cannot
-  satisfy.
+  tool list to fall back.
 - Falls back to pi's normal `edit` and `write` tools after switching away from a Codex model.
-- Enables Codex's standalone live `web_search` tool for the `openai-codex` provider. Rendering adapts: standalone (or with goodies' clean-tui disabled) it renders like pi's native tool rows with the search output visible; with bermudis-pi-goodies' clean-tui enabled it renders as a clean burst row (same-tool calls share one block; output hidden until the row is expanded).
-- Sends standalone search to the resolved Codex `/alpha/search` endpoint, preserving provider base URL and header overrides.
+- Enables OpenAI's hosted Responses `web_search` tool for the built-in `openai`
+  provider when the tool is selected and the connection goes directly to
+  `https://api.openai.com/v1`. It is not sent to proxy endpoints; GPT-5 at
+  minimal reasoning is also excluded because OpenAI documents that combination
+  as unsupported. A request-level instruction prefers hosted search over MCP
+  web-search tools when both are available. OpenAI's citation annotations are
+  rendered as clickable source links in the saved answer.
+- Enables Codex's standalone live `web_search` tool for `openai-codex`. It
+  posts to the resolved Codex `/alpha/search` endpoint, preserving provider
+  base URL and header overrides. Rendering adapts: standalone (or with
+  goodies' clean-tui disabled) it renders like pi's native tool rows with the
+  search output visible; with bermudis-pi-goodies' clean-tui enabled it renders
+  as a clean burst row (same-tool calls share one block; output hidden until
+  the row is expanded).
 - Uses current Codex remote compaction V2 for the `openai-codex` provider.
 - Applies Codex's model-facing middle-output truncation policy to package
   tools and the `tool_result` boundary, while retaining raw search output and

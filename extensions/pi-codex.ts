@@ -40,6 +40,7 @@ import {
   isServerCompactionCandidate,
   isServerCompactionDetails,
   MIN_SERVER_COMPACTION_PI_VERSION,
+  OPENAI_RESPONSES_BASE_URL,
   parseRemoteCompactionSse,
   parseServerCompactionManualResponse,
   piSupportsServerCompaction,
@@ -87,7 +88,11 @@ import {
   resolveCodexTruncationPolicy,
   truncateCodexOutput,
 } from "../src/output-truncation.ts";
-import { installTopLevelResponsesTools } from "../src/responses-tools.ts";
+import {
+  appendOpenAIWebSearchCitationSources,
+  installOpenAIServerWebSearch,
+  installTopLevelResponsesTools,
+} from "../src/responses-tools.ts";
 
 const grammarPath = fileURLToPath(new URL("../src/apply-patch.lark", import.meta.url));
 const applyPatchGrammar = readFileSync(grammarPath, "utf8");
@@ -127,6 +132,7 @@ let activeServerCompactionKey: string | undefined;
 let serverCompactionAppendAvailable = piSupportsServerCompaction(PI_VERSION);
 let configuredServerCompactionReserveTokens = DEFAULT_LOCAL_COMPACTION_RESERVE_TOKENS;
 let serverCompactionAppendWarningEmitted = false;
+let serverWebSearchConnectionWarningEmitted = false;
 
 type PatchedSettingsPrototype = SettingsManager & {
   [compactionPatchMarker]?: true;
@@ -186,6 +192,35 @@ function isOpenAICodexModel(model: Model<any> | undefined): boolean {
 
 function isOpenAIResponsesModel(model: Model<any> | undefined): boolean {
   return model?.provider === "openai" && model?.api === "openai-responses";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isFirstPartyOpenAIWebSearchModel(
+  model: Model<any> | undefined,
+  providerBaseUrl?: string,
+): boolean {
+  if (!model || !isOpenAIResponsesModel(model)) return false;
+  // The built-in provider defaults to api.openai.com when neither the model
+  // nor provider auth overrides its URL. Never send hosted tools to proxies.
+  const effectiveBaseUrl =
+    providerBaseUrl ?? model.baseUrl ?? OPENAI_RESPONSES_BASE_URL;
+  return effectiveBaseUrl.trim().replace(/\/+$/, "") === OPENAI_RESPONSES_BASE_URL;
+}
+
+function supportsOpenAIServerWebSearch(
+  model: Model<any>,
+  payload: unknown,
+): boolean {
+  // OpenAI documents that GPT-5 at minimal reasoning does not support hosted
+  // web search. Avoid adding a tool declaration that would make the whole
+  // Responses request fail for that specific configuration.
+  if (model.id !== "gpt-5" || !isRecord(payload) || !isRecord(payload.reasoning)) {
+    return true;
+  }
+  return payload.reasoning.effort !== "minimal";
 }
 
 /**
@@ -1571,6 +1606,32 @@ export default function piCodex(pi: ExtensionAPI) {
 
     if (!isOpenAIResponsesModel(model)) return;
 
+    let providerBaseUrl: string | undefined;
+    let providerBaseUrlResolved = false;
+    if (webSearchSelected) {
+      try {
+        providerBaseUrl = await resolveProviderBaseUrl(ctx, model);
+        providerBaseUrlResolved = true;
+      } catch {
+        // A failed provider-auth lookup is not proof that this is the
+        // first-party endpoint. Fail closed for hosted tools, but do not make
+        // optional web search prevent an otherwise valid model request.
+        if (!serverWebSearchConnectionWarningEmitted) {
+          serverWebSearchConnectionWarningEmitted = true;
+          process.stderr.write(
+            "[pi-codex] native OpenAI web search disabled: could not resolve the effective provider endpoint\n",
+          );
+        }
+      }
+      if (
+        providerBaseUrlResolved &&
+        isFirstPartyOpenAIWebSearchModel(model, providerBaseUrl) &&
+        supportsOpenAIServerWebSearch(model, event.payload)
+      ) {
+        installOpenAIServerWebSearch(event.payload);
+      }
+    }
+
     if (!isServerCompactionCandidate(model)) {
       // Opted out at the model level; make sure a previously active server
       // connection cannot keep suppressing local compaction.
@@ -1579,7 +1640,9 @@ export default function piCodex(pi: ExtensionAPI) {
     }
 
     try {
-      const providerBaseUrl = await resolveProviderBaseUrl(ctx, model);
+      if (!providerBaseUrlResolved) {
+        providerBaseUrl = await resolveProviderBaseUrl(ctx, model);
+      }
       if (!isOpenAIServerCompactionModel(model, providerBaseUrl)) {
         // The same model can be repointed at a proxy via provider auth. Drop
         // the server threshold/capture state so the local path is restored.
@@ -1624,6 +1687,9 @@ export default function piCodex(pi: ExtensionAPI) {
   });
 
   pi.on("provider_stream_event", (event) => {
+    if (event.provider === "openai" && event.api === "openai-responses") {
+      appendOpenAIWebSearchCitationSources(event.data);
+    }
     if (event.provider !== "openai" || event.api !== "openai-responses") return;
     // Only fold items while the server path owns the active connection. A
     // proxied or opted-out model can emit a compaction item of its own; it

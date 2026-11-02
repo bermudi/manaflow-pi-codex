@@ -805,8 +805,9 @@ test("swaps write tools only while a Codex model is selected", async () => {
 
 test("gives grammar-capable OpenAI Responses models the Codex tool surface", async () => {
   // The built-in openai provider is a first-class Codex-protocol connection:
-  // gpt-6-luna there must get apply_patch, not pi's edit/write. web_search
-  // stays off because it calls Codex's own chatgpt.com endpoint.
+  // gpt-6-luna there must get apply_patch, not pi's edit/write. The client
+  // web_search tool is removed from this loadout; the request hook supplies
+  // OpenAI's native hosted tool only on the first-party connection.
   let active = ["read", "bash", "edit", "write"];
   const handlers = new Map<string, (...args: any[]) => unknown>();
   const pi = {
