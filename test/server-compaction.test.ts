@@ -2390,32 +2390,58 @@ test("after /reload the threshold patch follows the reloaded module's state", as
     baseUrl: "https://api.anthropic.com",
     contextWindow: 200_000,
   } as any;
+  // AgentSession.reload(): session_shutdown on the old runner, invalidate,
+  // ResourceLoader.reload() (module re-evaluated), then session_start with
+  // reason "reload" on the new instance.
+  const shutdown = { type: "session_shutdown", reason: "reload" };
+  const reloadStart = { type: "session_start", reason: "reload" };
   try {
-    // Reload while server compaction is active; afterwards the same model is
-    // proxied, so the reloaded module turns the server path off. The local
-    // threshold must come back instead of staying suppressed at reserve 0.
+    // Reload while server compaction is active. The reloaded module owns the
+    // server path, so the local threshold must stay suppressed, and the
+    // overflow fallback must restore the configured reserve, not the default.
     const first = createHarness();
-    await first.handlers.get("session_start")?.({}, createContext(server).ctx);
+    const direct = createContext(server).ctx;
+    await first.handlers.get("session_start")?.({}, direct);
     assert.equal(settings.getCompactionSettings(server).reserveTokens, 0);
 
+    await first.handlers.get("session_shutdown")?.(shutdown, direct);
     const afterReload = await reloadedHarness(1);
-    const proxied = createContext(server, { providerBaseUrl: "https://proxy.example/v1" }).ctx;
-    await afterReload.get("session_start")?.({}, proxied);
-    const payload: any = { input: [] };
-    await afterReload.get("before_provider_request")?.({ payload }, proxied);
-    assert.equal(Object.hasOwn(payload, "context_management"), false);
+    await afterReload.get("session_start")?.(reloadStart, direct);
     assert.equal(
       settings.getCompactionSettings(server).reserveTokens,
+      0,
+      "after /reload the server path lost its local-threshold suppression",
+    );
+    const preparation: any = {
+      settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 20_000 },
+    };
+    const result = await afterReload.get("session_before_compact")?.(
+      {
+        preparation,
+        branchEntries: [],
+        customInstructions: undefined,
+        reason: "overflow",
+        willRetry: false,
+        signal: new AbortController().signal,
+      },
+      direct,
+    );
+    assert.equal(result, undefined);
+    assert.equal(
+      preparation.settings.reserveTokens,
       8_192,
-      "a stale server-compaction state kept pi's local threshold suppressed",
+      "the overflow fallback restored the default reserve instead of the configured one",
     );
 
-    // Reload while on Codex, then switch to a non-Codex model.
+    // Reload while on Codex, then switch to a non-Codex model. Shutdown does
+    // not reset the Codex context window, so a stale patch keeps applying it.
     const again = createHarness();
-    await again.handlers.get("session_start")?.({}, createContext(codex).ctx);
+    const codexCtx = createContext(codex).ctx;
+    await again.handlers.get("session_start")?.({}, codexCtx);
     assert.equal(settings.getCompactionSettings(codex).reserveTokens, CODEX_SOL_RESERVE_TOKENS);
+    await again.handlers.get("session_shutdown")?.(shutdown, codexCtx);
     const secondReload = await reloadedHarness(2);
-    await secondReload.get("session_start")?.({}, createContext(codex).ctx);
+    await secondReload.get("session_start")?.(reloadStart, codexCtx);
     await secondReload.get("model_select")?.({ model: claude }, createContext(claude).ctx);
     assert.equal(
       settings.getCompactionSettings(claude).reserveTokens,
