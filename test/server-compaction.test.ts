@@ -79,6 +79,8 @@ function createContext(
     providerBaseUrl?: string | null;
     providerAuthError?: Error;
     appendCompaction?: boolean;
+    apiKey?: string;
+    authError?: string;
   } = {},
 ) {
   const directAppends: any[][] = [];
@@ -95,6 +97,12 @@ function createContext(
           auth: { baseUrl: options.providerBaseUrl ?? model.baseUrl },
           source: "test",
         };
+      },
+      async getApiKeyAndHeaders() {
+        if (options.authError !== undefined) {
+          return { ok: false, error: options.authError };
+        }
+        return { ok: true, apiKey: options.apiKey ?? "test-key", headers: {} };
       },
     },
     sessionManager: {
@@ -1677,13 +1685,15 @@ test("server models suppress the local threshold but keep local summarization us
       preparation,
       branchEntries: [],
       customInstructions: undefined,
-      reason: "manual",
+      // Overflow recovery is the remaining local fallback on this
+      // connection: the manual /compact reason now takes the server fold.
+      reason: "overflow",
       willRetry: false,
       signal: new AbortController().signal,
     },
     serverContext.ctx,
   );
-  assert.equal(result, undefined, "manual /compact must stay on pi's local path");
+  assert.equal(result, undefined, "overflow recovery must stay on pi's local path");
   assert.equal(preparation.settings.reserveTokens, 8_192);
 
   const codex = {
@@ -1716,4 +1726,396 @@ test("server models suppress the local threshold but keep local summarization us
     { ...anthropicContext.ctx, model: anthropic },
   );
   assert.equal(settings.getCompactionSettings(anthropic).reserveTokens, 8_192);
+});
+
+// ── Manual (on-demand) server compaction: /compact on the openai connection ──
+//
+// The 2026-10-29 live probe pinned this path: on the ChatGPT-plan OAuth
+// connection the `compaction_trigger` input item is rejected
+// (subscription_sharing_unsupported_capability) and /responses/compact is
+// unauthorized (hardened_oauth_rule_missing), but a dedicated /responses
+// request with context_management forced to the 1000-token minimum compacts
+// on demand. The stream may carry several compaction items; the last one
+// folds everything, and response.completed may carry an empty output array.
+
+import {
+  buildCompactRequest,
+  buildServerCompactionHeaders,
+  parseServerCompactionManualResponse,
+  serverCompactionManualRequest,
+  serverCompactionRequestUrl,
+} from "../src/remote-compaction.ts";
+
+function manualSse(): string {
+  const lines = [
+    { type: "response.created", response: { id: "resp-manual" } },
+    { type: "response.output_item.added", output_index: 0, item: { type: "compaction", id: "cmp_first" } },
+    { type: "response.output_item.done", output_index: 0, item: { type: "compaction", id: "cmp_first", encrypted_content: "CIPHER-FIRST" } },
+    { type: "response.output_item.added", output_index: 1, item: { type: "message", id: "msg_1" } },
+    { type: "response.output_text.delta", delta: "throwaway continuation" },
+    { type: "response.output_item.done", output_index: 1, item: { type: "message", id: "msg_1", content: [] } },
+    { type: "response.output_item.added", output_index: 2, item: { type: "compaction", id: "cmp_last" } },
+    { type: "response.output_item.done", output_index: 2, item: { type: "compaction", id: "cmp_last", encrypted_content: "CIPHER-LAST" } },
+    {
+      type: "response.completed",
+      response: {
+        id: "resp-manual",
+        output: [],
+        usage: {
+          input_tokens: 120,
+          output_tokens: 30,
+          total_tokens: 150,
+          input_tokens_details: { cached_tokens: 20, cache_write_tokens: 10 },
+          output_tokens_details: { reasoning_tokens: 12 },
+        },
+      },
+    },
+  ];
+  return [...lines.map((event) => `data: ${JSON.stringify(event)}`), "data: [DONE]", ""].join("\n");
+}
+
+test("serverCompactionManualRequest forces the threshold and omits the trigger item", () => {
+  const model = serverModel();
+  const body = serverCompactionManualRequest({
+    model,
+    messages: [{ role: "user", content: "fold me", timestamp: 1 }] as any,
+    instructions: "system",
+    promptCacheKey: "session-test",
+  });
+  assert.equal(body.store, false);
+  assert.equal(body.stream, true);
+  assert.deepEqual(body.context_management, [
+    { type: "compaction", compact_threshold: 1_000 },
+  ]);
+  assert.notEqual(body.input.at(-1)?.type, "compaction_trigger");
+  assert.equal(body.input.at(-1)?.role, "user");
+  assert.equal(body.prompt_cache_key, "session-test");
+});
+
+test("buildCompactRequest still appends the Codex trigger by default", () => {
+  const body = buildCompactRequest({
+    model: serverModel(),
+    messages: [{ role: "user", content: "fold me", timestamp: 1 }] as any,
+    instructions: "system",
+  });
+  assert.deepEqual(body.input.at(-1), { type: "compaction_trigger" });
+  assert.equal(body.context_management, undefined);
+});
+
+test("serverCompactionRequestUrl resolves the connection's /responses route", () => {
+  assert.equal(serverCompactionRequestUrl(), "https://api.openai.com/v1/responses");
+  assert.equal(
+    serverCompactionRequestUrl("https://api.openai.com/v1/"),
+    "https://api.openai.com/v1/responses",
+  );
+});
+
+test("buildServerCompactionHeaders carries plain auth, no Codex flags", () => {
+  const headers = buildServerCompactionHeaders(
+    "tok",
+    { "x-model": "m", "x-model-drop": null },
+    { "x-auth": "a" },
+  );
+  assert.equal(headers.get("authorization"), "Bearer tok");
+  assert.equal(headers.get("x-model"), "m");
+  assert.equal(headers.get("x-auth"), "a");
+  assert.equal(headers.has("x-model-drop"), false);
+  assert.equal(headers.get("accept"), "text/event-stream");
+  assert.equal(headers.get("content-type"), "application/json");
+  assert.equal(headers.has("chatgpt-account-id"), false);
+  assert.equal(headers.has("x-codex-beta-features"), false);
+  assert.equal(headers.has("originator"), false);
+});
+
+test("parseServerCompactionManualResponse takes the last compaction item", () => {
+  const parsed = parseServerCompactionManualResponse(manualSse());
+  assert.equal(parsed.item.encrypted_content, "CIPHER-LAST");
+  assert.equal(parsed.responseId, "resp-manual");
+  assert.equal(parsed.tokenUsage?.input_tokens, 120);
+});
+
+test("parseServerCompactionManualResponse rejects a stream with no compaction item", () => {
+  const noItem = manualSse()
+    .split("\n")
+    .filter((line) => !line.includes("compaction"))
+    .join("\n");
+  assert.throws(() => parseServerCompactionManualResponse(noItem), /no compaction item/);
+});
+
+test("parseServerCompactionManualResponse rejects a stream that never completed", () => {
+  const truncated = manualSse()
+    .split("\n")
+    .filter((line) => !line.includes("response.completed"))
+    .join("\n");
+  assert.throws(() => parseServerCompactionManualResponse(truncated), /response\.completed/);
+});
+
+test("parseServerCompactionManualResponse surfaces a server-side failure", () => {
+  const failed = [
+    { type: "response.created", response: { id: "resp-fail" } },
+    {
+      type: "response.failed",
+      response: { id: "resp-fail", error: { code: "server_error", message: "model overloaded" } },
+    },
+  ]
+    .map((event) => `data: ${JSON.stringify(event)}`)
+    .join("\n");
+  assert.throws(() => parseServerCompactionManualResponse(failed), /model overloaded/);
+});
+
+test("parseServerCompactionManualResponse names an incomplete ending", () => {
+  const incomplete = [
+    { type: "response.created", response: { id: "resp-inc" } },
+    { type: "response.incomplete", response: { id: "resp-inc", incomplete_details: { reason: "max_output_tokens" } } },
+  ]
+    .map((event) => `data: ${JSON.stringify(event)}`)
+    .join("\n");
+  assert.throws(() => parseServerCompactionManualResponse(incomplete), /ended incomplete/);
+});
+
+function manualPreparation(overrides: Record<string, unknown> = {}): any {
+  return {
+    firstKeptEntryId: "kept-entry",
+    messagesToSummarize: [{ role: "user", content: "old context", timestamp: 1 }],
+    turnPrefixMessages: [],
+    tokensBefore: 100_000,
+    previousSummary: undefined,
+    fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+    settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 20_000 },
+    ...overrides,
+  };
+}
+
+async function callManualCompaction(
+  handlers: Map<string, Handler>,
+  ctx: any,
+  overrides: {
+    preparation?: Record<string, unknown>;
+    event?: Record<string, unknown>;
+  } = {},
+): Promise<any> {
+  return handlers.get("session_before_compact")?.(
+    {
+      preparation: manualPreparation(overrides.preparation ?? {}),
+      branchEntries: [],
+      customInstructions: undefined,
+      reason: "manual",
+      willRetry: false,
+      signal: new AbortController().signal,
+      ...(overrides.event ?? {}),
+    },
+    ctx,
+  );
+}
+
+function stubFetch(capture: { url?: string; init?: RequestInit }, respond: () => Response) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    capture.url = String(input);
+    capture.init = init;
+    return respond();
+  };
+  return () => {
+    globalThis.fetch = originalFetch;
+  };
+}
+
+test("manual /compact folds server-side through a forced-threshold request", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel());
+  const capture: { url?: string; init?: RequestInit } = {};
+  const restore = stubFetch(capture, () =>
+    new Response(manualSse(), { status: 200, headers: { "content-type": "text/event-stream" } }));
+  try {
+    const result = await callManualCompaction(handlers, ctx);
+    assert.equal(capture.url, "https://api.openai.com/v1/responses");
+    const headers = new Headers(capture.init?.headers);
+    assert.equal(headers.get("authorization"), "Bearer test-key");
+    assert.equal(headers.has("x-codex-beta-features"), false);
+    const body = JSON.parse(String(capture.init?.body));
+    assert.equal(body.model, "gpt-6-sol");
+    assert.equal(body.store, false);
+    assert.equal(body.stream, true);
+    assert.deepEqual(body.context_management, [
+      { type: "compaction", compact_threshold: 1_000 },
+    ]);
+    assert.notEqual(body.input.at(-1)?.type, "compaction_trigger");
+    assert.equal(body.input.at(-1).role, "user");
+    assert.equal(body.input.at(-1).content[0].text, "old context");
+    assert.equal(body.prompt_cache_key, "session-test");
+    assert.equal(body.instructions, "system");
+
+    const compaction = result.compaction;
+    assert.match(compaction.summary, /^\[pi-codex server compaction /);
+    assert.equal(compaction.firstKeptEntryId, "kept-entry");
+    assert.equal(compaction.tokensBefore, 100_000);
+    assert.equal(compaction.details.type, SERVER_COMPACTION_KIND);
+    assert.equal(compaction.details.version, SERVER_COMPACTION_VERSION);
+    assert.equal(compaction.details.item.encrypted_content, "CIPHER-LAST");
+    assert.equal(compaction.details.modelId, "gpt-6-sol");
+    assert.equal(compaction.usage.input, 90);
+    assert.equal(compaction.usage.output, 30);
+    assert.equal(compaction.usage.cacheRead, 20);
+    assert.equal(compaction.usage.cacheWrite, 10);
+    assert.equal(compaction.usage.reasoning, 12);
+  } finally {
+    restore();
+  }
+});
+
+test("manual fold chains an existing server checkpoint into the request", async () => {
+  const { handlers } = createHarness();
+  const previous = detailsFor("cp-prev", { type: "compaction", id: "cmp_prev", encrypted_content: "PREV-CIPHER" });
+  const { ctx } = createContext(serverModel(), {
+    branch: [{ type: "compaction", id: "c1", details: previous }],
+  });
+  const capture: { url?: string; init?: RequestInit } = {};
+  const restore = stubFetch(capture, () =>
+    new Response(manualSse(), { status: 200, headers: { "content-type": "text/event-stream" } }));
+  try {
+    const result = await callManualCompaction(handlers, ctx, {
+      preparation: { previousSummary: serverCompactionMarker("cp-prev") },
+    });
+    const body = JSON.parse(String(capture.init?.body));
+    assert.deepEqual(body.input[0], previous.item);
+    // Replace mode: the marker text is not a message — the item replaces it.
+    assert.equal(
+      body.input.some((item: any) =>
+        JSON.stringify(item).includes("Previous compaction summary")),
+      false,
+    );
+    assert.equal(result.compaction.details.modelId, "gpt-6-sol");
+  } finally {
+    restore();
+  }
+});
+
+test("manual fold carries a prior local summary when no checkpoint exists", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel());
+  const capture: { init?: RequestInit } = {};
+  const restore = stubFetch(capture, () =>
+    new Response(manualSse(), { status: 200, headers: { "content-type": "text/event-stream" } }));
+  try {
+    await callManualCompaction(handlers, ctx, {
+      preparation: { previousSummary: "goal: ship the fold" },
+    });
+    const body = JSON.parse(String(capture.init?.body));
+    assert.equal(body.input[0].type, "message");
+    assert.match(body.input[0].content[0].text, /Previous compaction summary:\ngoal: ship the fold/);
+  } finally {
+    restore();
+  }
+});
+
+test("manual fold chains an older server checkpoint under a newer local summary", async () => {
+  const { handlers } = createHarness();
+  const previous = detailsFor("cp-old", { type: "compaction", id: "cmp_old", encrypted_content: "OLD-CIPHER" });
+  // Newest boundary is a LOCAL compaction; the server checkpoint is older —
+  // prepend mode. The fold must send BOTH, opaque item first.
+  const { ctx } = createContext(serverModel(), {
+    branch: [
+      { type: "compaction", id: "srv-1", details: previous },
+      { type: "compaction", id: "local-1", summary: "local fold summary" },
+    ],
+  });
+  const capture: { init?: RequestInit } = {};
+  const restore = stubFetch(capture, () =>
+    new Response(manualSse(), { status: 200, headers: { "content-type": "text/event-stream" } }));
+  try {
+    const result = await callManualCompaction(handlers, ctx, {
+      preparation: { previousSummary: "local fold summary" },
+    });
+    const body = JSON.parse(String(capture.init?.body));
+    assert.deepEqual(body.input[0], previous.item);
+    assert.equal(body.input[1].type, "message");
+    assert.match(
+      body.input[1].content[0].text,
+      /Previous compaction summary:\nlocal fold summary/,
+    );
+    assert.equal(result.compaction.details.item.encrypted_content, "CIPHER-LAST");
+  } finally {
+    restore();
+  }
+});
+
+test("manual fold declines a proxied connection and keeps the local path", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel(), { providerBaseUrl: "https://proxy.test/v1" });
+  const restore = stubFetch({}, () => {
+    throw new Error("fetch must not run on a proxied connection");
+  });
+  try {
+    const result = await callManualCompaction(handlers, ctx);
+    assert.equal(result, undefined);
+  } finally {
+    restore();
+  }
+});
+
+test("manual fold declines an empty span and non-openai models without fetching", async () => {
+  const { handlers } = createHarness();
+  const anthropic = {
+    id: "claude-opus-4",
+    provider: "anthropic",
+    api: "anthropic",
+    baseUrl: "https://api.anthropic.com",
+    contextWindow: 200_000,
+  };
+  const calls: string[] = [];
+  const restore = stubFetch({}, () => {
+    calls.push("fetch");
+    throw new Error("must not fetch");
+  });
+  try {
+    const serverContext = createContext(serverModel());
+    const empty = await callManualCompaction(handlers, serverContext.ctx, {
+      preparation: { messagesToSummarize: [], turnPrefixMessages: [] },
+    });
+    assert.equal(empty, undefined);
+    const other = await callManualCompaction(handlers, createContext(anthropic as any).ctx);
+    assert.equal(other, undefined);
+    const threshold = await callManualCompaction(handlers, serverContext.ctx, {
+      event: { reason: "threshold" },
+    });
+    assert.equal(threshold, undefined);
+    assert.deepEqual(calls, []);
+  } finally {
+    restore();
+  }
+});
+
+test("manual fold surfaces an auth failure instead of silently going local", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel(), { authError: "no openai auth" });
+  const restore = stubFetch({}, () => {
+    throw new Error("must not fetch");
+  });
+  try {
+    await assert.rejects(
+      () => callManualCompaction(handlers, ctx),
+      /no openai auth/,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("manual fold reports a failing fold request", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(serverModel());
+  // 429 + retry-after-ms: 0 keeps fetchRemoteCompaction's retries instant.
+  const restore = stubFetch({}, () =>
+    new Response("rate limited", {
+      status: 429,
+      headers: { "retry-after-ms": "0" },
+    }));
+  try {
+    await assert.rejects(
+      () => callManualCompaction(handlers, ctx),
+      /OpenAI server compaction failed \(429\)/,
+    );
+  } finally {
+    restore();
+  }
 });

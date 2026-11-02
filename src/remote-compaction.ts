@@ -116,6 +116,8 @@ export interface CompactRequest {
   prompt_cache_key?: string;
   service_tier?: string;
   text: { verbosity: "low" };
+  /** Set by the manual server-compaction fold; absent on Codex turns. */
+  context_management?: Array<{ type: "compaction"; compact_threshold: number }>;
 }
 
 /** A self-contained checkpoint produced by OpenAI server-side compaction. */
@@ -742,7 +744,7 @@ export function convertCompactionMessages(
   });
 }
 
-export function buildCompactRequest(options: {
+export interface CompactRequestOptions {
   model: Model<any>;
   messages: CompactionMessages;
   previousOutput?: ResponseItem[];
@@ -758,7 +760,17 @@ export function buildCompactRequest(options: {
     constrainedSampling?: any;
     defer_loading?: boolean;
   }>;
-}): CompactRequest {
+  /**
+   * Append the Codex `compaction_trigger` final input item (default true).
+   * The plain openai connection rejects that item on ChatGPT-plan
+   * credentials (`subscription_sharing_unsupported_capability`, probe
+   * 2026-10-29), so the manual server fold disables it and forces the
+   * `context_management` threshold instead.
+   */
+  appendTrigger?: boolean;
+}
+
+export function buildCompactRequest(options: CompactRequestOptions): CompactRequest {
   const mappedEffort = options.thinkingLevel
     ? options.model.thinkingLevelMap?.[options.thinkingLevel as keyof typeof options.model.thinkingLevelMap] ??
       options.thinkingLevel
@@ -789,7 +801,7 @@ export function buildCompactRequest(options: {
     input: [
       ...(options.previousOutput ?? []),
       ...convertCompactionMessages(options.model, options.messages),
-      { type: "compaction_trigger" },
+      ...(options.appendTrigger === false ? [] : [{ type: "compaction_trigger" }]),
     ],
     instructions,
     include: ["reasoning.encrypted_content"],
@@ -801,6 +813,60 @@ export function buildCompactRequest(options: {
     ...(options.serviceTier ? { service_tier: options.serviceTier } : {}),
     text: { verbosity: "low" },
   };
+}
+
+/**
+ * Build the manual (on-demand) server-compaction request for the plain
+ * openai Responses connection: the same body a Codex compaction turn sends,
+ * minus the `compaction_trigger` item, plus `context_management` forced to
+ * the API minimum so the server folds immediately regardless of context
+ * size. Live probe 2026-10-29 on the ChatGPT-plan OAuth connection: the
+ * trigger item is rejected (`subscription_sharing_unsupported_capability`,
+ * "use an API key instead") and the standalone `/responses/compact`
+ * endpoint is unauthorized (`hardened_oauth_rule_missing`), while the forced
+ * threshold — the parameter the automatic path already uses — compacts on
+ * demand. The continuation message the server generates after folding is
+ * discarded by the caller; the compaction item is the payload.
+ */
+export function serverCompactionManualRequest(
+  options: Omit<CompactRequestOptions, "appendTrigger">,
+): CompactRequest {
+  const body = buildCompactRequest({ ...options, appendTrigger: false });
+  body.context_management = [
+    { type: "compaction", compact_threshold: MIN_SERVER_COMPACTION_THRESHOLD },
+  ];
+  return body;
+}
+
+/** Endpoint for the manual fold: the connection's own /responses route. */
+export function serverCompactionRequestUrl(baseUrl?: string): string {
+  return `${normalizedBaseUrl(baseUrl ?? OPENAI_RESPONSES_BASE_URL)}/responses`;
+}
+
+/**
+ * Headers for a manual server-compaction request on the plain openai
+ * connection. Deliberately NOT buildCompactHeaders: that carries the Codex
+ * connection's beta flags and requires a ChatGPT account-id JWT claim. The
+ * probe ran with exactly these headers — auth plus the SSE/content types.
+ */
+export function buildServerCompactionHeaders(
+  token: string,
+  modelHeaders?: Record<string, string | null>,
+  authHeaders?: Record<string, string | null>,
+): Headers {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(modelHeaders ?? {})) {
+    if (value == null) headers.delete(name);
+    else headers.set(name, value);
+  }
+  for (const [name, value] of Object.entries(authHeaders ?? {})) {
+    if (value == null) headers.delete(name);
+    else headers.set(name, value);
+  }
+  headers.set("authorization", `Bearer ${token}`);
+  headers.set("accept", "text/event-stream");
+  headers.set("content-type", "application/json");
+  return headers;
 }
 
 /** Convert the package contract into the same wire shape Pi uses for a turn. */
@@ -881,6 +947,22 @@ export async function fetchRemoteCompaction(
   throw lastError ?? new Error("Codex remote compaction failed after retries");
 }
 
+/** Parse the JSON payload of every `data:` line in an SSE body. */
+function parseSseData(text: string): any[] {
+  const events: any[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice(5).trim();
+    if (!data || data === "[DONE]") continue;
+    try {
+      events.push(JSON.parse(data));
+    } catch {
+      continue;
+    }
+  }
+  return events;
+}
+
 export function parseRemoteCompactionSse(text: string): {
   compaction: ResponseItem;
   responseId?: string;
@@ -892,16 +974,7 @@ export function parseRemoteCompactionSse(text: string): {
   let responseId: string | undefined;
   let tokenUsage: Record<string, unknown> | undefined;
   let turnState: string | undefined;
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.startsWith("data:")) continue;
-    const data = line.slice(5).trim();
-    if (!data || data === "[DONE]") continue;
-    let event: any;
-    try {
-      event = JSON.parse(data);
-    } catch {
-      continue;
-    }
+  for (const event of parseSseData(text)) {
     if (event.type === "response.output_item.done" && event.item?.type === "compaction") {
       compactions.push(event.item);
     }
@@ -936,6 +1009,62 @@ export function parseRemoteCompactionSse(text: string): {
     ...(responseId ? { responseId } : {}),
     ...(tokenUsage ? { tokenUsage } : {}),
     ...(turnState ? { turnState } : {}),
+  };
+}
+
+/**
+ * Parse the SSE stream of a manual server-compaction request (dedicated
+ * forced-threshold /responses call). The server may emit several compaction
+ * items — the 2026-10-29 probe saw one before its continuation message and
+ * one after — so folding follows the automatic path's rule: the LAST
+ * `output_item.done` item is authoritative, because it folds everything the
+ * response produced up to that point. `response.completed` may carry an
+ * empty `output` array on this path, so the terminal event is required only
+ * as a completeness check; usage is taken from it when present. The
+ * continuation message is deliberately not returned.
+ */
+export function parseServerCompactionManualResponse(text: string): {
+  item: ResponseItem;
+  tokenUsage?: Record<string, unknown>;
+  responseId?: string;
+} {
+  let capture: ServerCompactionCapture | undefined;
+  let completed = false;
+  let incomplete = false;
+  let failureMessage: string | undefined;
+  for (const event of parseSseData(text)) {
+    capture = updateServerCompactionCapture(capture, event);
+    if (isProviderResponseCompleted(event)) completed = true;
+    if (event.type === "response.failed") {
+      const error = objectValue(event.response)?.error ?? event.error;
+      const message = objectValue(error)?.message;
+      failureMessage =
+        typeof message === "string" && message.length > 0
+          ? message
+          : JSON.stringify(error ?? event) || "unknown error";
+    }
+    if (event.type === "response.incomplete") incomplete = true;
+  }
+  if (!completed) {
+    // Name the actual terminal state: a server-side failure carries its own
+    // message, and reporting either as "ended before response.completed"
+    // would misdiagnose both.
+    if (failureMessage !== undefined) {
+      throw new Error(`OpenAI server compaction failed: ${failureMessage}`);
+    }
+    if (incomplete) {
+      throw new Error("OpenAI server compaction stream ended incomplete");
+    }
+    throw new Error("OpenAI server compaction stream ended before response.completed");
+  }
+  const item = capture?.item;
+  if (!item || typeof item !== "object") {
+    throw new Error("OpenAI server compaction returned no compaction item");
+  }
+  return {
+    item,
+    ...(capture?.tokenUsage ? { tokenUsage: capture.tokenUsage } : {}),
+    ...(capture?.responseId ? { responseId: capture.responseId } : {}),
   };
 }
 

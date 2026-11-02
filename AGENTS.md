@@ -102,6 +102,18 @@ assistant message already carries it), and do not commit a checkpoint for a
 truncated (`stopReason: "length"`) response before pi's recoverable-length
 recovery runs.
 
+Manual `/compact` on the openai connection is a server fold, not the capture
+path: one dedicated `/responses` request with `context_management` forced to
+the 1000-token minimum, chained onto the active checkpoint item. The
+ChatGPT-plan credential rejects both the `compaction_trigger` input item
+(`subscription_sharing_unsupported_capability`) and `/v1/responses/compact`
+(`hardened_oauth_rule_missing`) — live probe 2026-10-29 — so the forced
+threshold is the mechanism on every credential. The stream may carry several
+compaction items; the LAST folds everything and is authoritative, and
+`response.completed` may arrive with an empty `output` array. Only
+`reason: "manual"` takes the path; overflow recovery keeps pi's local
+summarizer (an overflowed window cannot fit the fold request's input).
+
 ## Tool visibility (Pi 1.4.0)
 
 The recorded `toolsAdded` list proves Pi declared a tool locally, not that the

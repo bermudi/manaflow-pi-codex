@@ -11,8 +11,9 @@ import {
   renderDiff,
   SettingsManager,
   VERSION as PI_VERSION,
-  type ToolDefinition,
   type ExtensionAPI,
+  type SessionBeforeCompactEvent,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Text, type Box } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -24,6 +25,7 @@ import {
   buildCompactHeaders,
   buildCompactRequest,
   buildReplacementHistory,
+  buildServerCompactionHeaders,
   checkpointMarker,
   convertCodexTools,
   fingerprintContext,
@@ -39,6 +41,7 @@ import {
   isServerCompactionDetails,
   MIN_SERVER_COMPACTION_PI_VERSION,
   parseRemoteCompactionSse,
+  parseServerCompactionManualResponse,
   piSupportsServerCompaction,
   prependServerCompactionCheckpoint,
   retainedContextItems,
@@ -47,9 +50,12 @@ import {
   SERVER_COMPACTION_KIND,
   SERVER_COMPACTION_VERSION,
   serverCompactionMarker,
+  serverCompactionManualRequest,
+  serverCompactionRequestUrl,
   toPiUsage,
   updateServerCompactionCapture,
   type RemoteCompactionDetails,
+  type ResponseItem,
   type ServerCompactionCapture,
   type ServerCompactionDetails,
   resolveCompactUrl,
@@ -1259,14 +1265,132 @@ export default function piCodex(pi: ExtensionAPI) {
     };
   });
 
+  /**
+   * Manual (`/compact`) server-side fold for the plain openai Responses
+   * connection. One dedicated request to the connection's own /responses
+   * route with `context_management` forced to the API minimum (1000 tokens)
+   * compacts on demand; the last compaction item from the stream becomes a
+   * server checkpoint through pi's ordinary session_before_compact result,
+   * so marker repair, model-binding warnings, and the footer all behave like
+   * the automatic path. Returns undefined when this connection/model does
+   * not own the server path — pi's local summary then runs exactly as
+   * before. Only `reason: "manual"` takes this path: the threshold arm is
+   * the server's job on this connection, and an overflowed window cannot
+   * satisfy the fold request's input-size requirement, so overflow recovery
+   * keeps the local summarizer.
+   *
+   * Deliberately not gated on piSupportsServerCompaction or
+   * SessionManager.appendCompaction: the fold observes no provider stream
+   * and drafts no boundary entries — it rides session_before_compact's
+   * result contract, whose details passthrough has been stable pi API far
+   * below the 0.99 floor the automatic path needs.
+   */
+  async function manualServerCompaction(
+    event: SessionBeforeCompactEvent,
+    ctx: any,
+    model: Model<any> | undefined,
+  ) {
+    if (model === undefined || !isServerCompactionCandidate(model)) return undefined;
+    const messages = [
+      ...event.preparation.messagesToSummarize,
+      ...event.preparation.turnPrefixMessages,
+    ];
+    // Nothing new to fold: let pi's local path report "nothing to compact"
+    // instead of re-folding the existing checkpoint into a fresh one.
+    if (messages.length === 0) return undefined;
+
+    // Chain the active context into the fold. Pi's span starts at the latest
+    // boundary, so without the previous checkpoint item (and any local
+    // summary that superseded its view) the new checkpoint would drop
+    // everything older than the span.
+    const plan = serverCompactionInstallPlan(ctx);
+    const previousItems: ResponseItem[] = [];
+    if (plan) previousItems.push(plan.details.item);
+    const previousSummary =
+      plan?.mode === "replace" ? undefined : event.preparation.previousSummary;
+    if (previousSummary) {
+      previousItems.push({
+        type: "message",
+        role: "user",
+        content: [{
+          type: "input_text",
+          text: `Previous compaction summary:\n${previousSummary}`,
+        }],
+      });
+    }
+
+    const providerBaseUrl = await resolveProviderBaseUrl(ctx, model);
+    if (!isOpenAIServerCompactionModel(model, providerBaseUrl)) return undefined;
+
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (!auth.ok || !auth.apiKey) {
+      throw new Error(auth.ok ? "OpenAI OAuth token is unavailable" : auth.error);
+    }
+
+    const body = serverCompactionManualRequest({
+      model,
+      messages,
+      previousOutput: previousItems,
+      instructions: ctx.getSystemPrompt(),
+      customInstructions: event.customInstructions,
+      thinkingLevel: ctx.thinkingLevel,
+      promptCacheKey: ctx.sessionManager.getSessionId(),
+      tools: activeCodexToolSpecs(),
+    });
+    const { response, text: responseText } = await fetchRemoteCompaction(
+      serverCompactionRequestUrl(providerBaseUrl),
+      {
+        method: "POST",
+        headers: buildServerCompactionHeaders(
+          auth.apiKey,
+          model.headers as Record<string, string | null> | undefined,
+          auth.headers as Record<string, string | null> | undefined,
+        ),
+        body: JSON.stringify(body),
+        signal: event.signal,
+      },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `OpenAI server compaction failed (${response.status}): ${responseText || response.statusText}`,
+      );
+    }
+
+    const parsed = parseServerCompactionManualResponse(responseText);
+    const checkpointId = randomUUID();
+    const details: ServerCompactionDetails = {
+      type: SERVER_COMPACTION_KIND,
+      version: SERVER_COMPACTION_VERSION,
+      checkpointId,
+      item: parsed.item,
+      modelId: model.id,
+      ...(parsed.tokenUsage ? { tokenUsage: parsed.tokenUsage } : {}),
+    };
+    return {
+      compaction: {
+        summary: serverCompactionMarker(checkpointId),
+        firstKeptEntryId: event.preparation.firstKeptEntryId,
+        tokensBefore: event.preparation.tokensBefore,
+        // The fold request is its own model call — no assistant message
+        // carries this usage, so recording it here cannot double-count.
+        ...(parsed.tokenUsage ? { usage: toPiUsage(parsed.tokenUsage) } : {}),
+        details,
+      },
+    };
+  }
+
   pi.on("session_before_compact", async (event, ctx) => {
     const model = ctx.model;
     if (!model || !supportsCodexRemoteCompaction(model)) {
+      if (event.reason === "manual") {
+        const manual = await manualServerCompaction(event, ctx, model);
+        if (manual) return manual;
+      }
       if (hasServerCompactionAppend(ctx) && isActiveServerCompactionModel(model)) {
         // The server path suppresses Pi's local threshold by zeroing
-        // reserveTokens. Local summarization (manual /compact or the overflow
-        // fallback) still needs its configured output budget; restore it for
-        // this preparation only.
+        // reserveTokens. Local summarization (the overflow fallback, or a
+        // manual /compact the server fold could not take over) still needs
+        // its configured output budget; restore it for this preparation only.
         event.preparation.settings.reserveTokens =
           configuredServerCompactionReserveTokens;
       }
