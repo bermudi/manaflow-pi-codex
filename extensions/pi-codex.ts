@@ -578,17 +578,24 @@ function applyPatchDefaultRenderResult(
   const cwd = typeof ctx?.cwd === "string" ? ctx.cwd : undefined;
   const isError = !!ctx?.isError || !!(result as any)?.isError;
   burstTracker.recordResult(ctx?.toolCallId, result, isError);
-  const details = result?.details as ApplyPatchDetails | undefined;
-  const renderedDiffs = details?.diffs
-    .map(
-      ({ path, diff }) =>
-        `${theme.fg("muted", displayPath(path, cwd))}\n${renderDiff(diff, { filePath: path })}`,
-    )
-    .join("\n\n");
+  // Failed, aborted, and blocked calls carry pi-agent-core's error result,
+  // `details: {}` (createErrorToolResult), not ApplyPatchDetails; their text
+  // content is the only diagnostic and must reach the box below.
+  const details = result?.details as Partial<ApplyPatchDetails> | undefined;
+  const diffs = details?.diffs;
+  const changedPaths = details?.changedPaths;
+  const renderedDiffs = Array.isArray(diffs)
+    ? diffs
+        .map(
+          ({ path, diff }) =>
+            `${theme.fg("muted", displayPath(path, cwd))}\n${renderDiff(diff, { filePath: path })}`,
+        )
+        .join("\n\n")
+    : undefined;
   const text =
     renderedDiffs ??
-    (details?.changedPaths.length
-      ? `Updated ${details.changedPaths.map((path) => displayPath(path, cwd)).join(", ")}`
+    (Array.isArray(changedPaths) && changedPaths.length
+      ? `Updated ${changedPaths.map((path) => displayPath(path, cwd)).join(", ")}`
       : (result?.content ?? [])
           .map((item: any) => (item.type === "text" ? item.text : ""))
           .join("\n"));

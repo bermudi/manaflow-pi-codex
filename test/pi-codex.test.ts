@@ -1802,3 +1802,36 @@ test("Codex compaction surfaces the server's failure instead of a truncation", (
     /ended before response.completed/,
   );
 });
+
+test("default apply_patch rendering shows a failed call's error text", () => {
+  // pi-agent-core's createErrorToolResult — used for thrown, aborted, and
+  // blocked tool calls — carries `details: {}`, not ApplyPatchDetails.
+  let tool: any;
+  piCodex({
+    registerCommand() {},
+    registerTool(definition: any) {
+      if (definition.name === "apply_patch") tool = definition;
+    },
+    appendEntry() {},
+    getActiveTools: () => [],
+    getAllTools: () => [],
+    setActiveTools() {},
+    on() {},
+  } as unknown as ExtensionAPI);
+  initTheme(undefined, false);
+  const failed = {
+    content: [{ type: "text", text: "Failed to find expected lines in hello.txt" }],
+    details: {},
+  };
+  const ctx = { ...renderCtx("call-failed"), isError: true };
+  const rendered = tool.renderResult(
+    failed,
+    { expanded: false, isPartial: false },
+    renderTheme(),
+    ctx,
+  );
+  assert.match(
+    stripVTControlCharacters(rendered.render(120).join("\n")),
+    /Failed to find expected lines in hello\.txt/,
+  );
+});
