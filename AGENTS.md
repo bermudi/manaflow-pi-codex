@@ -86,8 +86,11 @@ Releasing is a **tag push**, not a local `npm publish`:
    @bermudi/pi-codex@<new>` succeeds in the same breath. Do not call a publish
    failed on that. Confirm against the registry itself
    (`curl -sS https://registry.npmjs.org/@bermudi%2Fpi-codex | jq '.["dist-tags"]'`)
-   and re-query with `--prefer-online`. Verify `dist.gitHead` equals the release
-   commit, then install the *published* tarball into a fake HOME and boot it —
+   and re-query with `--prefer-online`. `dist.gitHead` is always null on this
+   publish path (OIDC provenance, npm ≥ 11 — null since ≤ 0.1.12); commit
+   linkage is carried by the workflow's tag ↔ version check and the signed
+   provenance statement instead, so do not treat a null gitHead as a failed
+   publish. Then install the *published* tarball into a fake HOME and boot it —
    the published artifact, not the local `npm pack`, is the thing users get.
 
 ## Server compaction capture
