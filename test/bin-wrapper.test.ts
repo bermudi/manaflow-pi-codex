@@ -60,6 +60,12 @@ test("pi-codex defaults the provider and passes the exit code through", { skip: 
   const explicit = await runWrapper("ok", ["--model", "anthropic/claude-sonnet-4-6"]);
   assert.deepEqual(explicit.passed.slice(2), ["--model", "anthropic/claude-sonnet-4-6"]);
 
+  // pi (1.3.0 and 1.4.0) rejects --provider without --model, so a run
+  // without a model must not get the provider default.
+  const bare = await runWrapper("ok", []);
+  assert.equal(bare.passed[0], "-e");
+  assert.deepEqual(bare.passed.slice(2), []);
+
   const failed = await runWrapper("code3", []);
   assert.equal(failed.code, 3);
 });

@@ -17,7 +17,13 @@ function optionValue(args, name) {
 const provider = optionValue(userArgs, "--provider");
 const model = optionValue(userArgs, "--model");
 const modelHasProvider = model?.includes("/") ?? false;
-const defaults = provider || modelHasProvider ? [] : ["--provider", "openai-codex"];
+// pi rejects `--provider` without `--model` ("--provider requires --model"),
+// so the openai-codex default only scopes a bare model pattern. Without a
+// model, pi starts on its own default/last model.
+const defaults =
+  model !== undefined && !provider && !modelHasProvider
+    ? ["--provider", "openai-codex"]
+    : [];
 const child = spawn("pi", ["-e", packageRoot, ...defaults, ...userArgs], {
   stdio: "inherit",
   env: process.env,

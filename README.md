@@ -39,18 +39,21 @@ Applying a patch correctly is separate. This package pins `@openai/codex` and in
 ## Launcher
 
 The package also includes a `pi-codex` launcher that loads the extension for
-one run and defaults pi to the `openai-codex` provider. Install it from a
-checkout:
+one run and resolves a bare `--model` pattern against the `openai-codex`
+provider. Install it from a checkout:
 
 ```bash
 git clone https://github.com/bermudi/manaflow-pi-codex.git
-cd pi-codex
+cd manaflow-pi-codex
 npm install
 npm link
 pi-codex
 ```
 
-The launcher loads this package and defaults pi to the `openai-codex` provider. Normal pi arguments work:
+Without `--model`, pi starts on its own default model (pi rejects `--provider`
+without `--model`). Use the launcher from a checkout or `pi install`, not both:
+pi refuses to start when two copies of this package register the same tools.
+Normal pi arguments work:
 
 ```bash
 pi-codex --model gpt-5.6-sol:high
