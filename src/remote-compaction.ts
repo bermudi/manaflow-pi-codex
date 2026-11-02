@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import type {
-  Context,
-  Model,
-  TranscriptContext,
-  Usage,
+import {
+  calculateCost,
+  type Context,
+  type Model,
+  type TranscriptContext,
+  type Usage,
 } from "@earendil-works/pi-ai";
 import {
   convertToLlm,
@@ -599,8 +600,29 @@ function numeric(value: unknown): number {
     : 0;
 }
 
-/** Convert Responses usage fields into the Usage shape Pi stores in compaction entries. */
-export function toPiUsage(value: Record<string, unknown> | undefined): Usage | undefined {
+function hasCostRates(cost: unknown): boolean {
+  if (!cost || typeof cost !== "object") return false;
+  const rates = cost as Record<string, unknown>;
+  return ["input", "output", "cacheRead", "cacheWrite"].every(
+    (key) => typeof rates[key] === "number" && Number.isFinite(rates[key]),
+  );
+}
+
+/**
+ * Convert Responses usage fields into the Usage shape Pi stores in compaction
+ * entries, priced with the model's catalog rates.
+ *
+ * Pi totals `entry.usage.cost` as stored (session stats, cost breakdown), so
+ * an unpriced entry hides the compaction request from the session cost while
+ * every streamed assistant message is priced by pi-ai's `calculateCost`. A
+ * model without numeric rates keeps a zero cost rather than a NaN total. The
+ * service-tier (Fast/priority) multiplier is private to pi-ai's Codex
+ * transport and is not applied here.
+ */
+export function toPiUsage(
+  value: Record<string, unknown> | undefined,
+  model?: Pick<Model<any>, "cost">,
+): Usage | undefined {
   if (!value) return undefined;
   const inputDetails =
     value.input_tokens_details &&
@@ -634,7 +656,7 @@ export function toPiUsage(value: Record<string, unknown> | undefined): Usage | u
   const totalTokens =
     numeric(value.total_tokens ?? value.totalTokens) ||
     input + output + cacheRead + cacheWrite;
-  return {
+  const usage: Usage = {
     input,
     output,
     cacheRead,
@@ -649,6 +671,8 @@ export function toPiUsage(value: Record<string, unknown> | undefined): Usage | u
       total: 0,
     },
   };
+  if (model && hasCostRates(model.cost)) calculateCost(model as Model<any>, usage);
+  return usage;
 }
 
 export function checkpointMarker(checkpointId: string): string {

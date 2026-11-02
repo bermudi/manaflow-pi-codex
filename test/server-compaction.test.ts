@@ -2151,3 +2151,87 @@ test("manual fold reports a failing fold request", async () => {
     restore();
   }
 });
+
+// ── Compaction usage is priced like a streamed response ──
+//
+// Pi totals `entry.usage.cost` as stored (getSessionStats, the cost
+// breakdown); pi-ai prices every streamed assistant message with
+// calculateCost. A compaction entry carrying a zero cost silently drops the
+// compaction request — often the largest input of the session — from the
+// session cost.
+
+import { toPiUsage } from "../src/remote-compaction.ts";
+
+const responsesUsage = {
+  input_tokens: 120,
+  output_tokens: 30,
+  total_tokens: 150,
+  input_tokens_details: { cached_tokens: 20, cache_write_tokens: 10 },
+  output_tokens_details: { reasoning_tokens: 12 },
+};
+
+test("toPiUsage prices usage with the model's catalog rates", () => {
+  const usage = toPiUsage(responsesUsage, {
+    cost: { input: 2, output: 8, cacheRead: 0.5, cacheWrite: 2.5 },
+  } as any);
+  assert.ok(usage);
+  assert.ok(Math.abs(usage.cost.input - (90 * 2) / 1e6) < 1e-15);
+  assert.ok(Math.abs(usage.cost.output - (30 * 8) / 1e6) < 1e-15);
+  assert.ok(Math.abs(usage.cost.cacheRead - (20 * 0.5) / 1e6) < 1e-15);
+  assert.ok(Math.abs(usage.cost.cacheWrite - (10 * 2.5) / 1e6) < 1e-15);
+  assert.ok(
+    Math.abs(usage.cost.total - (90 * 2 + 30 * 8 + 20 * 0.5 + 10 * 2.5) / 1e6) < 1e-15,
+  );
+});
+
+test("toPiUsage applies the catalog's long-context pricing tier", () => {
+  const usage = toPiUsage(
+    { input_tokens: 300_000, output_tokens: 10 },
+    {
+      cost: {
+        input: 4,
+        output: 20,
+        cacheRead: 0.4,
+        cacheWrite: 5,
+        tiers: [{ inputTokensAbove: 272_000, input: 8, output: 30, cacheRead: 0.8, cacheWrite: 10 }],
+      },
+    } as any,
+  );
+  assert.ok(usage);
+  assert.ok(Math.abs(usage.cost.total - (300_000 * 8 + 10 * 30) / 1e6) < 1e-12);
+});
+
+test("toPiUsage keeps a zero cost when the model has no numeric rates", () => {
+  for (const model of [undefined, {}, { cost: undefined }, { cost: { input: 1 } }]) {
+    const usage = toPiUsage(responsesUsage, model as any);
+    assert.ok(usage);
+    assert.deepEqual(usage.cost, {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+    });
+    assert.equal(Number.isNaN(usage.cost.total), false);
+  }
+});
+
+test("manual server fold records the fold request's cost on the compaction entry", async () => {
+  const { handlers } = createHarness();
+  const { ctx } = createContext(
+    serverModel({ cost: { input: 2, output: 8, cacheRead: 0.5, cacheWrite: 2.5 } }),
+  );
+  const restore = stubFetch({}, () =>
+    new Response(manualSse(), { status: 200, headers: { "content-type": "text/event-stream" } }));
+  try {
+    const result = await callManualCompaction(handlers, ctx);
+    // manualSse() reports the same usage as responsesUsage above.
+    const expected = (90 * 2 + 30 * 8 + 20 * 0.5 + 10 * 2.5) / 1e6;
+    assert.ok(
+      Math.abs(result.compaction.usage.cost.total - expected) < 1e-15,
+      `expected ${expected}, got ${result.compaction.usage.cost.total}`,
+    );
+  } finally {
+    restore();
+  }
+});

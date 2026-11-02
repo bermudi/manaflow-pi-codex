@@ -950,6 +950,8 @@ test("remote compaction persists and reinstalls Codex replacement history", asyn
     reasoning: true,
     thinkingLevelMap: { medium: "medium" },
     compat: { supportsOpenAIGrammarTools: true },
+    // gpt-5.6-sol catalog rates (USD per million tokens).
+    cost: { input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 },
   };
   const replacement = [{ type: "compaction", encrypted_content: "opaque-checkpoint" }];
   let requestedUrl = "";
@@ -1043,6 +1045,13 @@ test("remote compaction persists and reinstalls Codex replacement history", asyn
     assert.equal(compaction.usage.cacheRead, 20);
     assert.equal(compaction.usage.cacheWrite, 10);
     assert.equal(compaction.usage.reasoning, 12);
+    // Pi sums compaction-entry cost as stored; an unpriced entry would show
+    // the compaction request as free in session stats.
+    const expectedCost = (90 * 4 + 30 * 20 + 20 * 0.4 + 10 * 5) / 1_000_000;
+    assert.ok(
+      Math.abs(compaction.usage.cost.total - expectedCost) < 1e-12,
+      `expected compaction cost ${expectedCost}, got ${compaction.usage.cost.total}`,
+    );
     assert.equal(compaction.details.retainedContextItemCount, 1);
     assert.equal(compaction.details.output.at(-1).encrypted_content, "opaque-checkpoint");
     branch.push({ type: "compaction", details: compaction.details });

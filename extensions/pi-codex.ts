@@ -1411,7 +1411,7 @@ export default function piCodex(pi: ExtensionAPI) {
         tokensBefore: event.preparation.tokensBefore,
         // The fold request is its own model call — no assistant message
         // carries this usage, so recording it here cannot double-count.
-        ...(parsed.tokenUsage ? { usage: toPiUsage(parsed.tokenUsage) } : {}),
+        ...(parsed.tokenUsage ? { usage: toPiUsage(parsed.tokenUsage, model) } : {}),
         details,
       },
     };
@@ -1530,7 +1530,7 @@ export default function piCodex(pi: ExtensionAPI) {
         firstKeptEntryId: event.preparation.firstKeptEntryId,
         tokensBefore: event.preparation.tokensBefore,
         ...(parsedCompaction.tokenUsage
-          ? { usage: toPiUsage(parsedCompaction.tokenUsage) }
+          ? { usage: toPiUsage(parsedCompaction.tokenUsage, model) }
           : {}),
         details,
       },
