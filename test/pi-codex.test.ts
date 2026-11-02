@@ -1835,3 +1835,81 @@ test("default apply_patch rendering shows a failed call's error text", () => {
     /Failed to find expected lines in hello\.txt/,
   );
 });
+
+// ── An interrupted apply_patch must not read as a successful edit ──
+//
+// The ExtensionAPI's exec is pi's execCommand (createExtensionAPI →
+// execCommand(command, args, options?.cwd ?? cwd, options)). It resolves a
+// signal-killed child — abort or timeout — as `{ code: 0, killed: true }`:
+// Node reports a null exit code, which execCommand maps to 0.
+
+async function piExecCommand() {
+  const piIndex = new URL(import.meta.resolve("@earendil-works/pi-coding-agent"));
+  return (await import(new URL("./core/exec.js", piIndex).href)).execCommand as (
+    command: string,
+    args: string[],
+    cwd: string,
+    options?: { signal?: AbortSignal; cwd?: string },
+  ) => Promise<{ stdout: string; stderr: string; code: number; killed: boolean }>;
+}
+
+function applyPatchWith(exec: (command: string, args: string[], options?: any) => Promise<any>) {
+  let tool: any;
+  piCodex({
+    registerCommand() {},
+    registerTool(definition: any) {
+      if (definition.name === "apply_patch") tool = definition;
+    },
+    appendEntry() {},
+    getActiveTools: () => [],
+    getAllTools: () => [],
+    setActiveTools() {},
+    on() {},
+    exec,
+  } as unknown as ExtensionAPI);
+  return tool;
+}
+
+test("pi's execCommand reports a killed child as code 0 with killed set", async () => {
+  const execCommand = await piExecCommand();
+  const aborted = new AbortController();
+  aborted.abort();
+  const result = await execCommand("sleep", ["5"], tmpdir(), { signal: aborted.signal });
+  assert.equal(result.killed, true);
+  assert.equal(result.code, 0, "pi changed how killed children report; revisit apply_patch");
+});
+
+test("an interrupted apply_patch is an error, not a successful edit", async () => {
+  const execCommand = await piExecCommand();
+  const cwd = await mkdtemp(join(tmpdir(), "pi-codex-abort-test-"));
+  try {
+    await writeFile(join(cwd, "hello.txt"), "hello\n");
+    const patch =
+      "*** Begin Patch\n*** Update File: hello.txt\n@@\n-hello\n+patched\n*** End Patch";
+
+    // Real Codex binary through pi's real execCommand, signal already aborted:
+    // the child is killed before it writes anything.
+    const real = applyPatchWith((command, args, options) =>
+      execCommand(command, args, options?.cwd ?? cwd, options),
+    );
+    const aborted = new AbortController();
+    aborted.abort();
+    await assert.rejects(
+      real.execute("call-abort", { patch }, aborted.signal, undefined, { cwd }),
+      /interrupted before it finished; no files were changed/,
+    );
+    assert.equal(await readFile(join(cwd, "hello.txt"), "utf8"), "hello\n");
+
+    // A kill after Codex wrote part of the patch names the touched file.
+    const partial = applyPatchWith(async () => {
+      await writeFile(join(cwd, "hello.txt"), "patched\n");
+      return { stdout: "", stderr: "", code: 0, killed: true };
+    });
+    await assert.rejects(
+      partial.execute("call-partial", { patch }, new AbortController().signal, undefined, { cwd }),
+      /may be partially updated: hello\.txt/,
+    );
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

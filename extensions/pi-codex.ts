@@ -1159,6 +1159,26 @@ export default function piCodex(pi: ExtensionAPI) {
         cwd: ctx.cwd,
         signal,
       });
+      if (result.killed) {
+        // pi's execCommand resolves a signal-killed child (abort or timeout)
+        // as `{ code: 0, killed: true }`: the exit code is null and becomes 0.
+        // Treating that as success would tell the model an edit landed when
+        // Codex may not have written anything, or written only part of it.
+        const touched = (
+          await Promise.all(
+            patchPaths.map(async (path) =>
+              (await readPatchFile(ctx.cwd, path)) !== (before.get(path) ?? "")
+                ? path
+                : undefined,
+            ),
+          )
+        ).filter((path): path is string => path !== undefined);
+        throw new Error(
+          touched.length > 0
+            ? `Codex apply_patch was interrupted before it finished; these files may be partially updated: ${touched.join(", ")}`
+            : "Codex apply_patch was interrupted before it finished; no files were changed",
+        );
+      }
       const output = [result.stdout.trimEnd(), result.stderr.trimEnd()]
         .filter(Boolean)
         .join("\n");
