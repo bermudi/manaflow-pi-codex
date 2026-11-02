@@ -13,6 +13,7 @@ import piCodex, {
 import {
   installServerCompactionCheckpoint,
   installServerCompactionContextManagement,
+  isFirstPartyOpenAIEndpoint,
   isOpenAIServerCompactionModel,
   isServerCompactionCandidate,
   isServerCompactionDetails,
@@ -142,6 +143,32 @@ function markerMessage(marker: string): any {
   };
 }
 
+test("shared first-party endpoint predicate has an explicit missing-URL policy", () => {
+  for (const missingUrlIsFirstParty of [true, false]) {
+    assert.equal(
+      isFirstPartyOpenAIEndpoint(undefined, missingUrlIsFirstParty),
+      missingUrlIsFirstParty,
+    );
+    for (const url of [
+      "https://api.openai.com/v1",
+      "https://api.openai.com/v1/",
+      "  https://api.openai.com/v1/// \n",
+    ]) {
+      assert.equal(isFirstPartyOpenAIEndpoint(url, missingUrlIsFirstParty), true, url);
+    }
+    for (const url of [
+      "",
+      "  ",
+      "https://proxy.test/v1",
+      "https://api.openai.com/v1/responses",
+      "https://api.openai.com.proxy.test/v1",
+      "http://api.openai.com/v1",
+    ]) {
+      assert.equal(isFirstPartyOpenAIEndpoint(url, missingUrlIsFirstParty), false, url);
+    }
+  }
+});
+
 test("server compaction predicate identifies the first-party openai Responses connection", () => {
   assert.equal(isOpenAIServerCompactionModel(serverModel()), true);
   assert.equal(
@@ -182,6 +209,11 @@ test("server compaction predicate identifies the first-party openai Responses co
     false,
   );
   assert.equal(isOpenAIServerCompactionModel(undefined), false);
+  assert.equal(isOpenAIServerCompactionModel(serverModel({ baseUrl: undefined })), false);
+  assert.equal(
+    isOpenAIServerCompactionModel(serverModel({ baseUrl: undefined }), "https://api.openai.com/v1"),
+    true,
+  );
 
   // Candidates still resolve provider auth; the effective-base-URL check is
   // what excludes proxies.

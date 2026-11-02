@@ -146,6 +146,7 @@ function removeWebSearchUnavailableNotice(message: unknown): unknown {
 
 function restoreWebSearchAvailability(text: string): string {
   let result = text;
+  let changed = false;
   const paragraphs = result.split("\n\n");
   const restored = paragraphs.map((paragraph) => {
     if (!paragraph.startsWith(`${TOOL_REMOVAL_NOTICE}\n`)) return paragraph;
@@ -156,6 +157,7 @@ function restoreWebSearchAvailability(text: string): string {
     if (names.some((name) => name === undefined) || !names.includes("web_search")) {
       return paragraph;
     }
+    changed = true;
     const remaining = names.filter(
       (name): name is string => name !== undefined && name !== "web_search",
     );
@@ -168,12 +170,17 @@ function restoreWebSearchAvailability(text: string): string {
   // Incremental tool notices use a compact comma-separated unavailable list
   // rather than the full removal notice above.
   result = result.replace(/Still unavailable: ([^\n.]+)\./g, (_notice, list: string) => {
-    const remaining = list
+    const names = list
       .split(",")
-      .map((name) => name.trim())
-      .filter((name) => name.length > 0 && name !== "web_search");
+      .map((name) => name.trim());
+    if (!names.includes("web_search")) return _notice;
+    changed = true;
+    const remaining = names.filter((name) => name.length > 0 && name !== "web_search");
     return remaining.length > 0 ? `Still unavailable: ${remaining.join(", ")}.` : "";
   });
+  // Separator cleanup is only justified when a notice was actually edited.
+  // Otherwise preserve the original prompt, including whitespace, verbatim.
+  if (!changed) return text;
   return result.replace(/\n{3,}/g, "\n\n").trim();
 }
 

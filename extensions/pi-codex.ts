@@ -34,13 +34,13 @@ import {
   installRemoteCheckpoint,
   installServerCompactionCheckpoint,
   installServerCompactionContextManagement,
+  isFirstPartyOpenAIEndpoint,
   isOpenAIServerCompactionModel,
   isProviderResponseCompleted,
   isRemoteCompactionDetails,
   isServerCompactionCandidate,
   isServerCompactionDetails,
   MIN_SERVER_COMPACTION_PI_VERSION,
-  OPENAI_RESPONSES_BASE_URL,
   parseRemoteCompactionSse,
   parseServerCompactionManualResponse,
   piSupportsServerCompaction,
@@ -205,15 +205,18 @@ function isFirstPartyOpenAIWebSearchModel(
   if (!model || !isOpenAIResponsesModel(model)) return false;
   // The built-in provider defaults to api.openai.com when neither the model
   // nor provider auth overrides its URL. Never send hosted tools to proxies.
-  const effectiveBaseUrl =
-    providerBaseUrl ?? model.baseUrl ?? OPENAI_RESPONSES_BASE_URL;
-  return effectiveBaseUrl.trim().replace(/\/+$/, "") === OPENAI_RESPONSES_BASE_URL;
+  return isFirstPartyOpenAIEndpoint(providerBaseUrl ?? model.baseUrl, true);
 }
 
 function supportsOpenAIServerWebSearch(
   model: Model<any>,
   payload: unknown,
 ): boolean {
+  // These catalog families do not support hosted web search on Responses.
+  // Include dated snapshots and o1 variants (pro, mini, preview), not just
+  // their aliases: an unsupported tool can reject the entire model request.
+  if (/^(?:o1|o3-mini|gpt-4\.1-nano)(?:-|$)/.test(model.id)) return false;
+
   // OpenAI documents that GPT-5 at minimal reasoning does not support hosted
   // web search. Avoid adding a tool declaration that would make the whole
   // Responses request fail for that specific configuration.

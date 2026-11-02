@@ -200,6 +200,19 @@ function normalizedBaseUrl(value: string | undefined): string {
 }
 
 /**
+ * Shared first-party endpoint check. Callers must explicitly choose whether a
+ * missing URL means the built-in OpenAI default or an unverified connection.
+ * A present but empty URL is never treated as the default.
+ */
+export function isFirstPartyOpenAIEndpoint(
+  baseUrl: string | undefined,
+  missingUrlIsFirstParty: boolean,
+): boolean {
+  if (baseUrl === undefined) return missingUrlIsFirstParty;
+  return normalizedBaseUrl(baseUrl) === OPENAI_RESPONSES_BASE_URL;
+}
+
+/**
  * True for the built-in `openai` provider on the Responses API, ignoring the
  * effective base URL (which may come from provider auth).
  *
@@ -243,7 +256,7 @@ export function isOpenAIServerCompactionModel(
 ): boolean {
   if (!isServerCompactionCandidate(model)) return false;
   const effective = providerBaseUrl ?? model?.baseUrl;
-  return normalizedBaseUrl(effective) === OPENAI_RESPONSES_BASE_URL;
+  return isFirstPartyOpenAIEndpoint(effective, false);
 }
 
 /**

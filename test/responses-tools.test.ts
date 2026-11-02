@@ -159,6 +159,53 @@ test("removes an empty removal notice before injecting the native search instruc
   assert.equal(payload.input[1].role, "user");
 });
 
+test("preserves unrelated developer and system text byte-for-byte", () => {
+  const texts = [
+    "\n  Preserve leading and trailing whitespace.  \n\n\n\nNext paragraph.\n\n ",
+    "\n\nThe following tools are no longer available. Do not call them:\n- edit\n- write\n\n\n",
+    "  Still unavailable: edit,  write.\n\n\n",
+    "\n\nThe following tools are no longer available. Do not call them:\nweb_search\n\n\n",
+    "\n Still unavailable: web_search_extra, write. \n\n\n",
+  ];
+  for (const role of ["developer", "system"]) {
+    for (const text of texts) {
+      for (const content of [
+        text,
+        [{ type: "input_text", text }, { type: "input_text", text: "" }],
+      ]) {
+        const message = { role, content };
+        const payload = { input: [message] };
+        installOpenAIServerWebSearch(payload);
+        assert.equal(payload.input[0], message);
+        assert.deepEqual(payload.input[0].content, content);
+      }
+    }
+  }
+});
+
+test("normalizes notice separators only after actually removing web_search", () => {
+  const payload = {
+    input: [{
+      role: "system",
+      content: [{
+        type: "input_text",
+        text: "\n\nKeep this.\n\nThe following tools are no longer available. Do not call them:\n- web_search\n\n\n\nStill unavailable: web_search.\n\nTail.  ",
+      }, {
+        type: "input_text",
+        text: "  Still unavailable: edit,  write.\n\n\n",
+      }],
+    }],
+  };
+  installOpenAIServerWebSearch(payload);
+  assert.deepEqual(payload.input[0].content, [{
+    type: "input_text",
+    text: "Keep this.\n\nTail.",
+  }, {
+    type: "input_text",
+    text: "  Still unavailable: edit,  write.\n\n\n",
+  }]);
+});
+
 test("adds clickable sources for OpenAI citation annotations before Pi parses the response", () => {
   const event = {
     type: "response.output_item.done",
@@ -266,6 +313,52 @@ test("request hook enables hosted search only for selected first-party OpenAI Re
   };
   await hook({ payload: hostedPayload } as never, firstPartyContext as never);
   assert.deepEqual(hostedPayload.tools, [{ type: "web_search" }]);
+
+  for (const baseUrl of [undefined, "  https://api.openai.com/v1/// \n"]) {
+    const payload: Record<string, unknown> = {
+      input: [{ role: "user", content: "Search this." }],
+    };
+    await hook(
+      { payload } as never,
+      { ...firstPartyContext, model: { ...firstParty, baseUrl } } as never,
+    );
+    assert.deepEqual(payload.tools, [{ type: "web_search" }]);
+  }
+
+  for (const id of [
+    "o1",
+    "o1-pro",
+    "o1-mini",
+    "o1-preview",
+    "o1-2024-12-17",
+    "o1-pro-2025-03-19",
+    "o3-mini",
+    "o3-mini-2025-01-31",
+    "gpt-4.1-nano",
+    "gpt-4.1-nano-2025-04-14",
+  ]) {
+    const payload: Record<string, unknown> = {
+      input: [{ role: "user", content: "Answer without hosted search." }],
+    };
+    const before = structuredClone(payload);
+    await hook(
+      { payload } as never,
+      { ...firstPartyContext, model: { ...firstParty, id } } as never,
+    );
+    assert.deepEqual(payload, before, `${id} must not receive hosted search or guidance`);
+  }
+
+  for (const id of ["o3", "o4-mini", "gpt-4.1-mini", "gpt-5"]) {
+    const payload: Record<string, unknown> = {
+      input: [{ role: "user", content: "Search this." }],
+      reasoning: { effort: "medium" },
+    };
+    await hook(
+      { payload } as never,
+      { ...firstPartyContext, model: { ...firstParty, id } } as never,
+    );
+    assert.deepEqual(payload.tools, [{ type: "web_search" }], id);
+  }
 
   const proxyPayload: Record<string, unknown> = {
     input: [{ role: "user", content: "Search this." }],
